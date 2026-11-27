@@ -35,10 +35,15 @@ def _post(server: str, path: str, body: dict) -> None:
 
 
 @contextmanager
-def _catalog_fault_proxy(server: str, fault: str):
-    """Inject a fault on the first guarded write and forward fresh reads to Unity."""
+def _catalog_fault_proxy(
+    server: str,
+    fault: str | None = None,
+    *,
+    first_config_status: HTTPStatus | None = None,
+):
+    """Inject the selected fault once and forward other requests to Unity."""
     target = urlsplit(server)
-    counts = {"requests": 0, "writes": 0}
+    counts = {"requests": 0, "writes": 0, "creates": 0, "config_reads": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -50,6 +55,14 @@ def _catalog_fault_proxy(server: str, fault: str):
         def forward(self):
             counts["requests"] += 1
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            path = urlsplit(self.path).path
+            if self.command == "GET" and path.endswith("/delta/v1/config"):
+                counts["config_reads"] += 1
+                if counts["config_reads"] == 1 and first_config_status is not None:
+                    self.send_error(first_config_status)
+                    return
+            if self.command == "POST" and path == "/api/2.1/unity-catalog/tables":
+                counts["creates"] += 1
             guarded_write = (
                 self.command == "POST" and "/delta/v1/catalogs/" in self.path
             )
@@ -168,6 +181,57 @@ def test_catalog_rejects_invalid_sync_profile():
 
 @pytest.mark.unitycatalog
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "status", [HTTPStatus.SERVICE_UNAVAILABLE, HTTPStatus.NOT_FOUND]
+)
+def test_catalog_registration_config_failure(unity_catalog_server, tmp_path, status):
+    from deltalake.catalog import load_catalog
+    from deltalake.exceptions import CatalogError
+
+    identifier = (f"negotiation_{status.value}", "fixtures", "orders")
+    _post(unity_catalog_server, "catalogs", {"name": identifier[0]})
+    _post(
+        unity_catalog_server,
+        "schemas",
+        {"catalog_name": identifier[0], "name": identifier[1]},
+    )
+    table = DeltaTable.create(tmp_path, Schema([Field("id", PrimitiveType("long"))]))
+    with _catalog_fault_proxy(unity_catalog_server, first_config_status=status) as (
+        proxy,
+        counts,
+    ):
+        catalog = load_catalog(
+            "unity",
+            options={
+                "workspace_url": proxy,
+                "access_token": "fixture",
+                "allow_http_url": "true",
+            },
+            sync_profile="oss_rust_server_0_0_2",
+        )
+        if status == HTTPStatus.SERVICE_UNAVAILABLE:
+            with pytest.raises(CatalogError, match="catalog provider request failed"):
+                catalog.register_table(identifier, tmp_path)
+            assert counts["creates"] == 0
+        assert catalog.register_table(identifier, tmp_path).status == "created"
+        assert counts["creates"] == 1
+        properties = _catalog_record(unity_catalog_server, identifier)["properties"]
+        assert properties["delta-rs.table-id"] == table.metadata().id
+        if status == HTTPStatus.SERVICE_UNAVAILABLE:
+            assert counts["config_reads"] == 2
+            assert properties["delta-rs.sync-version"] == str(table.version())
+            assert properties["delta-rs.sync-digest"]
+        else:
+            assert counts["config_reads"] == 1
+            assert "delta-rs.sync-version" not in properties
+            assert (
+                catalog.register_table(identifier, tmp_path).status
+                == "already_registered"
+            )
+
+
+@pytest.mark.unitycatalog
+@pytest.mark.integration
 @pytest.mark.parametrize("fault", ["stale_etag", "unknown", "ack_lost"])
 def test_catalog_guarded_sync(unity_catalog_server: str, tmp_path, fault: str):
     from deltalake.catalog import load_catalog
@@ -198,7 +262,7 @@ def test_catalog_guarded_sync(unity_catalog_server: str, tmp_path, fault: str):
         assert unqualified.supports_guarded_sync is False
         with pytest.raises(CatalogUnsupportedError):
             unqualified.sync_table_metadata(identifier)
-        assert counts == {"requests": 0, "writes": 0}
+        assert counts["requests"] == 0
 
         catalog = load_catalog(
             "unity", options=options, sync_profile="oss_rust_server_0_0_2"

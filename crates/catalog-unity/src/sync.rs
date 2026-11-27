@@ -98,13 +98,10 @@ impl UnityCatalog {
         ) else {
             return Ok(());
         };
-        // Registration is also available when the deployment cannot negotiate guarded sync.
-        if self
-            .metadata_session(registration.identifier())
-            .await
-            .is_err()
-        {
-            return Ok(());
+        match self.metadata_session(registration.identifier()).await {
+            Ok(_) => {}
+            Err(CatalogLifecycleError::Unsupported { .. }) => return Ok(()),
+            Err(error) => return Err(error),
         }
         let stamp = CatalogProjectionStamp::new(
             CATALOG_PROJECTION_FORMAT_VERSION,
