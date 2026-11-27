@@ -134,6 +134,7 @@ impl CatalogWriter for UnityCatalog {
         self.invalidate_table(&format!("{catalog}.{schema}.{name}"));
         let unknown = |source| CatalogLifecycleError::OutcomeUnknown {
             table: id.clone(),
+            attempted_stamp: None,
             source,
         };
         let response = result.map_err(|error| unknown(error.into()))?;

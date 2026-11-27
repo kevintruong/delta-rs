@@ -291,8 +291,14 @@ def test_catalog_guarded_sync(unity_catalog_server: str, tmp_path, fault: str):
                 if fault == "unknown"
                 else CatalogConflictError
             )
-            with pytest.raises(error):
+            with pytest.raises(error) as caught:
                 catalog.sync_table_metadata(identifier)
+            if isinstance(caught.value, CatalogOutcomeUnknownError):
+                assert caught.value.identifier == identifier
+                attempted = caught.value.attempted_stamp
+                assert attempted is not None
+                assert attempted.delta_id == registration.delta_id
+                assert attempted.delta_version == committed_version
             assert counts["writes"] == 1
             assert _catalog_record(unity_catalog_server, identifier) == before
             assert DeltaTable(path).version() == committed_version
@@ -325,6 +331,12 @@ def test_catalog_guarded_sync(unity_catalog_server: str, tmp_path, fault: str):
             entry.name: entry.read_bytes()
             for entry in (path / "_delta_log").glob("*.json")
         } == delta_log
+        if fault == "unknown":
+            assert attempted == updated.stamp
+            table.alter.add_columns(Field("tracking", PrimitiveType("string")))
+            later = catalog.sync_table_metadata(identifier)
+            assert later.stamp.delta_version > attempted.delta_version
+            assert later.stamp.digest != attempted.digest
 
 
 @pytest.mark.unitycatalog

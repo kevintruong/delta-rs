@@ -254,7 +254,8 @@ impl<B: CatalogSyncWriter> CatalogLifecycle<B> {
     /// Load a single committed Delta snapshot for each attempt. Allow one
     /// retry after a definitive rejection, using a fresh observation of the
     /// same binding and a different revision. After an ambiguous response,
-    /// perform read-back and preserve an unknown result unless confirmed.
+    /// perform read-back. An unconfirmed outcome carries the attempted projection
+    /// stamp so callers can reconcile it even after the Delta snapshot advances.
     pub async fn sync_table_metadata(
         &self,
         id: &TableIdentifier,
@@ -312,8 +313,8 @@ impl<B: CatalogSyncWriter> CatalogLifecycle<B> {
                 Ok(CatalogSyncWriteOutcome::Applied | CatalogSyncWriteOutcome::Unknown) => {
                     return self.confirm_sync(id, &state, &stamp, None).await;
                 }
-                Err(error @ CatalogLifecycleError::OutcomeUnknown { .. }) => {
-                    return self.confirm_sync(id, &state, &stamp, Some(error)).await;
+                Err(CatalogLifecycleError::OutcomeUnknown { source, .. }) => {
+                    return self.confirm_sync(id, &state, &stamp, Some(source)).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -340,7 +341,7 @@ impl<B: CatalogSyncWriter> CatalogLifecycle<B> {
         id: &TableIdentifier,
         previous: &CatalogSyncState<B::Record>,
         desired: &CatalogProjectionStamp,
-        ambiguous_write: Option<CatalogLifecycleError>,
+        write_error: Option<Box<dyn std::error::Error + Send + Sync>>,
     ) -> CatalogResult<CatalogSyncOutcome> {
         let failure = match self.read_sync_state(id).await {
             Ok(after)
@@ -363,12 +364,11 @@ impl<B: CatalogSyncWriter> CatalogLifecycle<B> {
             )),
             Err(error) => Box::new(error),
         };
-        Err(
-            ambiguous_write.unwrap_or_else(|| CatalogLifecycleError::OutcomeUnknown {
-                table: id.clone(),
-                source: failure,
-            }),
-        )
+        Err(CatalogLifecycleError::OutcomeUnknown {
+            table: id.clone(),
+            attempted_stamp: Some(Box::new(desired.clone())),
+            source: write_error.unwrap_or(failure),
+        })
     }
 }
 

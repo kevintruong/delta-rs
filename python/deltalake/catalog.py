@@ -88,7 +88,8 @@ class Catalog:
 
         Registering the same binding again returns `already_registered`.
         A different binding raises `CatalogConflictError`. An ambiguous
-        response with no confirmed read-back raises `CatalogOutcomeUnknownError`.
+        response with no confirmed read-back raises `CatalogOutcomeUnknownError`
+        with the scoped `identifier` and `attempted_stamp` set to `None`.
         """
         status, table, provider_id, delta_id = self._catalog.register_table(
             identifier, fspath(location)
@@ -107,7 +108,9 @@ class Catalog:
         by a separate read. An unsupported table or instance raises
         `CatalogUnsupportedError`. A competing binding or revision raises
         `CatalogConflictError`. A write with an unconfirmed outcome raises
-        `CatalogOutcomeUnknownError`. Reconciliation only writes to the catalog.
+        `CatalogOutcomeUnknownError`. Its `identifier` and `attempted_stamp`
+        identify the exact projection sent, even if Delta subsequently advances.
+        Reconciliation only writes to the catalog.
         """
         status, format_version, delta_id, delta_version, digest = (
             self._catalog.sync_table_metadata(identifier)

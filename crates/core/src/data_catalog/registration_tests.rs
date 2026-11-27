@@ -79,6 +79,7 @@ impl CatalogWriter for &TestCatalog {
             CreateBehavior::TransportErrorBeforeApply => {
                 Err(CatalogLifecycleError::OutcomeUnknown {
                     table: registration.identifier().clone(),
+                    attempted_stamp: None,
                     source: Box::new(std::io::Error::other("connection lost")),
                 })
             }

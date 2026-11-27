@@ -106,8 +106,12 @@ def test_unconfirmed_unity_registration_is_not_replayed(existing_sample_table):
             },
         )
         identifier = ("demo", "default", "orders")
-        with pytest.raises(CatalogOutcomeUnknownError, match="unable to confirm"):
+        with pytest.raises(
+            CatalogOutcomeUnknownError, match="unable to confirm"
+        ) as caught:
             catalog.register_table(identifier, existing_sample_table.table_uri)
+        assert caught.value.identifier == identifier
+        assert caught.value.attempted_stamp is None
         with pytest.raises(TableNotFoundError):
             catalog.load_table(identifier)
 

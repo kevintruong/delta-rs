@@ -195,6 +195,7 @@ impl CatalogSyncWriter for GlueDataCatalog {
             Err(error) if definitive_failure(&error) => Err(provider_error(error)),
             Err(error) => Err(CatalogLifecycleError::OutcomeUnknown {
                 table: id.clone(),
+                attempted_stamp: Some(Box::new(update.stamp().clone())),
                 source: Box::new(error),
             }),
         }

@@ -61,6 +61,8 @@ pub enum CatalogLifecycleError {
     OutcomeUnknown {
         /// Requested table.
         table: TableIdentifier,
+        /// Projection dispatched by guarded sync, or `None` for registration.
+        attempted_stamp: Option<Box<super::CatalogProjectionStamp>>,
         /// Error from the mutation attempt or the subsequent confirmation.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -435,6 +437,7 @@ impl<B: CatalogWriter> CatalogLifecycle<B> {
                 return Err(create_error.unwrap_or_else(|| {
                     CatalogLifecycleError::OutcomeUnknown {
                         table: id.clone(),
+                        attempted_stamp: None,
                         source: Box::new(error),
                     }
                 }));

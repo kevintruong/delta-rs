@@ -271,8 +271,33 @@ fn catalog_error(error: CatalogLifecycleError) -> PyErr {
         CatalogLifecycleError::Unsupported { .. } => {
             CatalogUnsupportedError::new_err(error.to_string())
         }
-        CatalogLifecycleError::OutcomeUnknown { .. } => {
-            CatalogOutcomeUnknownError::new_err(error.to_string())
+        CatalogLifecycleError::OutcomeUnknown {
+            ref table,
+            ref attempted_stamp,
+            ..
+        } => {
+            let unknown = CatalogOutcomeUnknownError::new_err(error.to_string());
+            Python::attach(|py| -> PyResult<PyErr> {
+                let mut identifier = table.namespace().to_vec();
+                identifier.push(table.name().to_owned());
+                let value = unknown.value(py);
+                value.setattr("identifier", PyTuple::new(py, identifier)?)?;
+                let stamp = match attempted_stamp {
+                    Some(stamp) => Some(py.import("deltalake.catalog")?.call_method1(
+                        "ProjectionStamp",
+                        (
+                            stamp.format_version(),
+                            stamp.delta_id(),
+                            stamp.delta_version(),
+                            stamp.digest(),
+                        ),
+                    )?),
+                    None => None,
+                };
+                value.setattr("attempted_stamp", stamp)?;
+                Ok(unknown)
+            })
+            .unwrap_or_else(|error| error)
         }
         CatalogLifecycleError::Delta(error) => PythonError::from(error).into(),
         _ => CatalogError::new_err(error.to_string()),

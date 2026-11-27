@@ -185,6 +185,7 @@ impl CatalogSyncWriter for TestCatalog {
             }
             Some(WriteStep::LoseAckWithoutApplying) => Err(CatalogLifecycleError::OutcomeUnknown {
                 table: current.entry().identifier().clone(),
+                attempted_stamp: None,
                 source: Box::new(std::io::Error::other("response lost")),
             }),
             Some(WriteStep::ApplyAndLoseAck) | None => {
@@ -472,15 +473,29 @@ async fn confirms_applied_unknown_updates_and_does_not_replay_ambiguous_results(
         ),
         (WriteStep::LoseAckWithoutApplying, false, "first-revision"),
     ] {
+        let lost_reply = matches!(step, WriteStep::LoseAckWithoutApplying);
         let lifecycle = CatalogLifecycle::new(fixture.catalog(0, [step]));
         let result = lifecycle.sync_table_metadata(&fixture.id).await;
         if applied {
             assert!(matches!(result, Ok(CatalogSyncOutcome::Updated(_))));
         } else {
-            assert!(matches!(
-                result,
-                Err(CatalogLifecycleError::OutcomeUnknown { .. })
-            ));
+            let Err(CatalogLifecycleError::OutcomeUnknown {
+                table,
+                attempted_stamp: Some(stamp),
+                source,
+            }) = result
+            else {
+                panic!("unconfirmed sync must identify the dispatched projection");
+            };
+            let mut projection = fixture.original.clone();
+            projection.fields.push("writer".into());
+            assert_eq!(table, fixture.id);
+            assert_eq!(stamp.delta_id(), fixture.delta_id);
+            assert_eq!(stamp.delta_version(), version);
+            assert_eq!(stamp.digest(), projection.digest());
+            if lost_reply {
+                assert_eq!(source.to_string(), "response lost");
+            }
         }
         assert_eq!(
             *lifecycle.backend.calls.lock().unwrap(),

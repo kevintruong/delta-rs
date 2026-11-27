@@ -334,6 +334,7 @@ impl CatalogSyncWriter for UnityCatalog {
             }
             Err(error) => Err(CatalogLifecycleError::OutcomeUnknown {
                 table: id.clone(),
+                attempted_stamp: Some(Box::new(update.stamp().clone())),
                 source: Box::new(error),
             }),
         }

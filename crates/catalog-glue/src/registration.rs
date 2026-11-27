@@ -157,6 +157,7 @@ impl CatalogWriter for GlueDataCatalog {
             }
             Err(error) if ambiguous_create(&error) => Err(CatalogLifecycleError::OutcomeUnknown {
                 table: id.clone(),
+                attempted_stamp: None,
                 source: Box::new(error),
             }),
             Err(error) => Err(provider_error(error)),

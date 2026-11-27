@@ -19,6 +19,7 @@ from arro3.core.types import ArrowSchemaExportable
 if TYPE_CHECKING:
     import pyarrow.fs as fs
 
+    from deltalake.catalog import ProjectionStamp
     from deltalake.transaction import (
         AddAction,
         CommitProperties,
@@ -1096,6 +1097,9 @@ class CatalogConflictError(CatalogError):
 
 class CatalogOutcomeUnknownError(CatalogError):
     """A mutation may have succeeded but its read-back could not be confirmed."""
+
+    identifier: tuple[str, ...]
+    attempted_stamp: ProjectionStamp | None
 
 class CatalogUnsupportedError(CatalogError):
     """The catalog or selected backend cannot perform the operation."""
