@@ -109,3 +109,59 @@ def test_uc_read_deltatable(
     assert dt.is_deltatable(dt.table_uri), True
     expected = pa.table(sample_table).to_pydict()
     assert dt.to_pyarrow_dataset().to_table().to_pydict() == expected
+
+
+@pytest.mark.unitycatalog
+@pytest.mark.pyarrow
+@pytest.mark.integration
+@pytest.mark.timeout(timeout=30, method="thread")
+def test_uc_register_then_load_by_name(
+    unity_catalog_server: str,
+    existing_sample_table: DeltaTable,
+    sample_table: Table,
+    tmp_path,
+):
+    from deltalake import write_deltalake
+    from deltalake.catalog import load_catalog
+    from deltalake.exceptions import CatalogConflictError
+
+    _post(unity_catalog_server, "catalogs", {"name": "lifecycle"})
+    _post(
+        unity_catalog_server,
+        "schemas",
+        {"name": "default", "catalog_name": "lifecycle"},
+    )
+    catalog = load_catalog(
+        "unity",
+        options={
+            "workspace_url": unity_catalog_server,
+            "access_token": "test-token",
+            "allow_http_url": "true",
+        },
+    )
+    identifier = ("lifecycle", "default", "orders")
+    location = existing_sample_table.table_uri
+    before = DeltaTable(location)
+
+    created = catalog.register_table(identifier, location)
+    assert created.status == "created"
+    assert created.provider_id
+    assert created.delta_id == before.metadata().id
+    assert created.table.metadata().id == created.delta_id
+    assert created.table.version() == before.version()
+
+    reused = catalog.register_table(identifier, location)
+    assert reused.status == "already_registered"
+    assert reused.provider_id == created.provider_id
+    assert reused.delta_id == created.delta_id
+
+    other = tmp_path / "other"
+    write_deltalake(other, sample_table)
+    with pytest.raises(CatalogConflictError):
+        catalog.register_table(identifier, other)
+    loaded = catalog.load_table(identifier)
+    assert loaded.metadata().id == created.delta_id
+    assert loaded.to_pyarrow_dataset().to_table().to_pydict() == (
+        before.to_pyarrow_dataset().to_table().to_pydict()
+    )
+    assert DeltaTable(location).version() == before.version()

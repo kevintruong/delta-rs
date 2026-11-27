@@ -78,6 +78,20 @@ class CommitInfoIterator:
     def __iter__(self) -> CommitInfoIterator: ...
     def __next__(self) -> str: ...
 
+class RawCatalog:
+    def __init__(
+        self,
+        provider: str,
+        options: dict[str, str],
+        storage_options: dict[str, str],
+    ) -> None: ...
+    def load_table(self, identifier: tuple[str, ...]) -> RawDeltaTable: ...
+    def register_table(
+        self, identifier: tuple[str, ...], location: str
+    ) -> tuple[
+        Literal["created", "already_registered"], RawDeltaTable, str | None, str
+    ]: ...
+
 class RawDeltaTable:
     schema: Any
 
@@ -1066,6 +1080,18 @@ class DeltaError(Exception):
     """The base class for Delta-specific errors."""
 
     pass
+
+class CatalogError(DeltaError):
+    """A provider or catalog lifecycle operation failed."""
+
+class CatalogConflictError(CatalogError):
+    """The name identifies a different or incompatible table."""
+
+class CatalogOutcomeUnknownError(CatalogError):
+    """A mutation may have succeeded but its read-back could not be confirmed."""
+
+class CatalogUnsupportedError(CatalogError):
+    """The catalog or selected backend cannot perform the operation."""
 
 class TableNotFoundError(DeltaError):
     """Raised when a Delta table cannot be loaded from a location."""

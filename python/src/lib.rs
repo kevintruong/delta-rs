@@ -1,3 +1,4 @@
+mod catalog;
 mod datafusion;
 mod error;
 mod features;
@@ -336,6 +337,16 @@ fn fallback_datafusion_task_context_provider() -> datafusion_ffi::execution::FFI
 /// In essence all these functions should be considered internal to the Rust code and not exposed
 /// up to the Python layer
 impl RawDeltaTable {
+    fn from_table(table: DeltaTable, options: HashMap<String, String>) -> Self {
+        Self {
+            _config: FsConfig {
+                root_url: table.table_url().clone(),
+                options,
+            },
+            _table: Arc::new(Mutex::new(table)),
+        }
+    }
+
     /// Internal helper method which allows for acquiring the lock on the underlying
     /// [deltalake::DeltaTable] and then executing the given function parameter with the guarded
     /// reference
@@ -456,13 +467,7 @@ impl RawDeltaTable {
             }
 
             let table = rt().block_on(builder.load()).map_err(PythonError::from)?;
-            Ok(RawDeltaTable {
-                _config: FsConfig {
-                    root_url: table.table_url().clone(),
-                    options,
-                },
-                _table: Arc::new(Mutex::new(table)),
-            })
+            Ok(Self::from_table(table, options))
         })
     }
 
@@ -3335,7 +3340,10 @@ fn _set_cast_nanos_timestamps_to_micros(cast: bool) {
 #[pymodule(gil_used = true)]
 // module name need to match project name
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    use crate::error::{CommitFailedError, DeltaError, SchemaMismatchError, TableNotFoundError};
+    use crate::error::{
+        CatalogConflictError, CatalogError, CatalogOutcomeUnknownError, CatalogUnsupportedError,
+        CommitFailedError, DeltaError, SchemaMismatchError, TableNotFoundError,
+    };
     deltalake::aws::register_handlers(None);
     deltalake::azure::register_handlers(None);
     deltalake::gcp::register_handlers(None);
@@ -3353,6 +3361,19 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DeltaProtocolError", py.get_type::<DeltaProtocolError>())?;
     m.add("TableNotFoundError", py.get_type::<TableNotFoundError>())?;
     m.add("SchemaMismatchError", py.get_type::<SchemaMismatchError>())?;
+    m.add("CatalogError", py.get_type::<CatalogError>())?;
+    m.add(
+        "CatalogConflictError",
+        py.get_type::<CatalogConflictError>(),
+    )?;
+    m.add(
+        "CatalogOutcomeUnknownError",
+        py.get_type::<CatalogOutcomeUnknownError>(),
+    )?;
+    m.add(
+        "CatalogUnsupportedError",
+        py.get_type::<CatalogUnsupportedError>(),
+    )?;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -3364,6 +3385,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(write_to_deltalake, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(convert_to_deltalake, m)?)?;
     m.add_class::<RawDeltaTable>()?;
+    m.add_class::<catalog::RawCatalog>()?;
     m.add_class::<CommitInfoIterator>()?;
     m.add_class::<PyMergeBuilder>()?;
     m.add_class::<PyQueryBuilder>()?;
