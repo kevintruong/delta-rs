@@ -6,12 +6,19 @@ import subprocess
 import sysconfig
 import time
 import urllib.request
+from contextlib import contextmanager
+from http import HTTPStatus
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from typing import Generator
+from urllib.parse import urlsplit
 
 import pytest
 from arro3.core import Table
 
 from deltalake import DeltaTable
+from deltalake.schema import Field, PrimitiveType, Schema
 
 
 def _api_url(server: str, path: str) -> str:
@@ -25,6 +32,86 @@ def _post(server: str, path: str, body: dict) -> None:
         headers={"Content-Type": "application/json"},
     )
     urllib.request.urlopen(request, timeout=10).close()
+
+
+@contextmanager
+def _catalog_fault_proxy(server: str, fault: str):
+    """Inject a fault on the first guarded write and forward fresh reads to Unity."""
+    target = urlsplit(server)
+    counts = {"requests": 0, "writes": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.forward()
+
+        def do_POST(self):
+            self.forward()
+
+        def forward(self):
+            counts["requests"] += 1
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            guarded_write = (
+                self.command == "POST" and "/delta/v1/catalogs/" in self.path
+            )
+            inject_fault = False
+            if guarded_write:
+                counts["writes"] += 1
+                inject_fault = counts["writes"] == 1
+                if inject_fault and fault == "unknown":
+                    self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                if inject_fault and fault == "stale_etag":
+                    payload = json.loads(body)
+                    for requirement in payload["requirements"]:
+                        if requirement["type"] == "assert-etag":
+                            requirement["etag"] = "stale-fixture-etag"
+                    body = json.dumps(payload).encode()
+
+            headers = {
+                name: self.headers[name]
+                for name in ("Authorization", "Content-Type")
+                if name in self.headers
+            }
+            connection = HTTPConnection(target.hostname, target.port, timeout=5)
+            try:
+                connection.request(self.command, self.path, body or None, headers)
+                response = connection.getresponse()
+                response_body = response.read()
+                if (
+                    inject_fault
+                    and fault == "ack_lost"
+                    and response.status == HTTPStatus.OK
+                ):
+                    self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                self.send_response(response.status)
+                for name in ("Content-Type", "ETag"):
+                    if response.getheader(name) is not None:
+                        self.send_header(name, response.getheader(name))
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+            finally:
+                connection.close()
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as proxy:
+        thread = Thread(target=proxy.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{proxy.server_port}", counts
+        finally:
+            proxy.shutdown()
+            thread.join()
+
+
+def _catalog_record(server: str, identifier: tuple[str, str, str]):
+    with urllib.request.urlopen(
+        _api_url(server, f"tables/{'.'.join(identifier)}"), timeout=5
+    ) as response:
+        return json.load(response)
 
 
 @pytest.fixture(scope="module")
@@ -68,6 +155,112 @@ def unity_catalog_server(tmp_path_factory) -> Generator[str, None, None]:
     finally:
         process.terminate()
         process.wait()
+
+
+def test_catalog_rejects_invalid_sync_profile():
+    from deltalake.catalog import load_catalog
+
+    with pytest.raises(ValueError, match="sync profile"):
+        load_catalog("unity", sync_profile="databricks")
+    with pytest.raises(ValueError, match="sync profile"):
+        load_catalog("glue", sync_profile="oss_rust_server_0_0_2")
+
+
+@pytest.mark.unitycatalog
+@pytest.mark.integration
+@pytest.mark.parametrize("fault", ["stale_etag", "unknown", "ack_lost"])
+def test_catalog_guarded_sync(unity_catalog_server: str, tmp_path, fault: str):
+    from deltalake.catalog import load_catalog
+    from deltalake.exceptions import (
+        CatalogConflictError,
+        CatalogOutcomeUnknownError,
+        CatalogUnsupportedError,
+    )
+
+    identifier = (f"guarded_{fault}", "fixtures", "orders")
+    catalog_name, schema_name, _ = identifier
+    _post(unity_catalog_server, "catalogs", {"name": catalog_name})
+    _post(
+        unity_catalog_server,
+        "schemas",
+        {"name": schema_name, "catalog_name": catalog_name},
+    )
+    path = tmp_path / "orders"
+    table = DeltaTable.create(path, Schema([Field("order_id", PrimitiveType("long"))]))
+
+    with _catalog_fault_proxy(unity_catalog_server, fault) as (proxy, counts):
+        options = {
+            "workspace_url": proxy,
+            "access_token": "fixture-token",
+            "allow_http_url": "true",
+        }
+        unqualified = load_catalog("unity", options=options)
+        assert unqualified.supports_guarded_sync is False
+        with pytest.raises(CatalogUnsupportedError):
+            unqualified.sync_table_metadata(identifier)
+        assert counts == {"requests": 0, "writes": 0}
+
+        catalog = load_catalog(
+            "unity", options=options, sync_profile="oss_rust_server_0_0_2"
+        )
+        assert catalog.supports_guarded_sync is True
+        registration = catalog.register_table(identifier, path)
+        before = _catalog_record(unity_catalog_server, identifier)
+        assert [column["name"] for column in before["columns"]] == ["order_id"]
+        assert before["table_id"] == registration.provider_id
+        assert before["properties"]["delta-rs.sync-version"] == "0"
+
+        table.alter.add_columns(Field("carrier", PrimitiveType("string")))
+        committed_version = DeltaTable(path).version()
+        assert committed_version == 1
+        delta_log = {
+            entry.name: entry.read_bytes()
+            for entry in (path / "_delta_log").glob("*.json")
+        }
+
+        if fault == "ack_lost":
+            updated = catalog.sync_table_metadata(identifier)
+            assert counts["writes"] == 1
+        else:
+            error = (
+                CatalogOutcomeUnknownError
+                if fault == "unknown"
+                else CatalogConflictError
+            )
+            with pytest.raises(error):
+                catalog.sync_table_metadata(identifier)
+            assert counts["writes"] == 1
+            assert _catalog_record(unity_catalog_server, identifier) == before
+            assert DeltaTable(path).version() == committed_version
+
+            updated = catalog.sync_table_metadata(identifier)
+            assert counts["writes"] == 2
+
+        assert updated.status == "updated"
+        assert updated.stamp.delta_id == registration.delta_id
+        assert updated.stamp.delta_version == committed_version
+        assert updated.stamp.format_version == 1
+        assert updated.stamp.digest
+        after = _catalog_record(unity_catalog_server, identifier)
+        assert after["table_id"] == before["table_id"]
+        assert after["properties"]["delta-rs.sync-version"] == str(committed_version)
+        assert [
+            (column["name"], column["type_text"]) for column in after["columns"]
+        ] == [
+            ("order_id", "bigint"),
+            ("carrier", "string"),
+        ]
+        assert catalog.load_table(identifier).version() == committed_version
+
+        writes = counts["writes"]
+        unchanged = catalog.sync_table_metadata(identifier)
+        assert unchanged.status == "unchanged"
+        assert unchanged.stamp == updated.stamp
+        assert counts["writes"] == writes
+        assert {
+            entry.name: entry.read_bytes()
+            for entry in (path / "_delta_log").glob("*.json")
+        } == delta_log
 
 
 @pytest.mark.unitycatalog

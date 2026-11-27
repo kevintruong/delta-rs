@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
 use deltalake::data_catalog::{
-    CatalogLifecycle, CatalogLifecycleError, RegistrationOutcome, TableIdentifier,
+    CatalogLifecycle, CatalogLifecycleError, CatalogSyncOutcome, RegistrationOutcome,
+    TableIdentifier,
 };
 #[cfg(any(feature = "rustls", feature = "native-tls"))]
 use deltalake::glue_catalog::GlueDataCatalog;
-use deltalake::unity_catalog::{UnityCatalog, UnityCatalogBuilder, UnityCatalogConfigKey};
+use deltalake::unity_catalog::{
+    UnityCatalog, UnityCatalogBuilder, UnityCatalogConfigKey, UnitySyncProfile,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -27,23 +30,40 @@ enum CatalogBackend {
 pub(crate) struct RawCatalog {
     backend: CatalogBackend,
     storage_options: HashMap<String, String>,
+    supports_guarded_sync: bool,
 }
 
 #[pymethods]
 impl RawCatalog {
     #[new]
+    #[pyo3(signature = (provider, options, storage_options, *, sync_profile=None))]
     fn new(
         py: Python<'_>,
         provider: &str,
         options: HashMap<String, String>,
         storage_options: HashMap<String, String>,
+        sync_profile: Option<&str>,
     ) -> PyResult<Self> {
-        let backend = py.detach(|| match provider {
-            "unity" => Ok(CatalogBackend::Unity(Box::new(
-                CatalogLifecycle::new(build_unity(options)?)
-                    .with_storage_options(storage_options.clone()),
-            ))),
-            "glue" => build_glue(options, &storage_options),
+        let sync_profile = match (provider, sync_profile) {
+            (_, None) => None,
+            ("unity", Some("oss_rust_server_0_0_2")) => Some(UnitySyncProfile::OssRustServer002),
+            _ => return Err(PyValueError::new_err("unsupported catalog sync profile")),
+        };
+        let (backend, supports_guarded_sync) = py.detach(|| match provider {
+            "unity" => {
+                let mut unity = build_unity(options)?;
+                if let Some(profile) = sync_profile {
+                    unity = unity.with_sync_profile(profile).map_err(catalog_error)?;
+                }
+                let supports_guarded_sync = unity.supports_guarded_sync();
+                let lifecycle =
+                    CatalogLifecycle::new(unity).with_storage_options(storage_options.clone());
+                Ok((
+                    CatalogBackend::Unity(Box::new(lifecycle)),
+                    supports_guarded_sync,
+                ))
+            }
+            "glue" => build_glue(options, &storage_options).map(|backend| (backend, false)),
             _ => Err(PyValueError::new_err(
                 "unknown catalog provider, expected 'glue' or 'unity'",
             )),
@@ -51,7 +71,13 @@ impl RawCatalog {
         Ok(Self {
             backend,
             storage_options,
+            supports_guarded_sync,
         })
+    }
+
+    #[getter]
+    fn supports_guarded_sync(&self) -> bool {
+        self.supports_guarded_sync
     }
 
     fn load_table(
@@ -111,6 +137,37 @@ impl RawCatalog {
             RawDeltaTable::from_table(table.into_table(), self.storage_options.clone()),
             provider_id,
             delta_id,
+        ))
+    }
+
+    fn sync_table_metadata(
+        &self,
+        py: Python<'_>,
+        identifier: &Bound<'_, PyTuple>,
+    ) -> PyResult<(&'static str, u32, String, u64, String)> {
+        let identifier = self.identifier(identifier.extract()?)?;
+        let catalog = match &self.backend {
+            CatalogBackend::Unity(catalog) if self.supports_guarded_sync => catalog,
+            _ => {
+                return Err(catalog_error(CatalogLifecycleError::Unsupported {
+                    table: identifier,
+                }));
+            }
+        };
+        let outcome = py
+            .detach(|| rt().block_on(catalog.sync_table_metadata(&identifier)))
+            .map_err(catalog_error)?;
+        let (status, stamp) = match outcome {
+            CatalogSyncOutcome::Updated(stamp) => ("updated", stamp),
+            CatalogSyncOutcome::Unchanged(stamp) => ("unchanged", stamp),
+            CatalogSyncOutcome::Superseded(stamp) => ("superseded", stamp),
+        };
+        Ok((
+            status,
+            stamp.format_version(),
+            stamp.delta_id().to_owned(),
+            stamp.delta_version(),
+            stamp.digest().to_owned(),
         ))
     }
 }

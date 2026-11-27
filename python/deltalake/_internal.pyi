@@ -84,13 +84,20 @@ class RawCatalog:
         provider: str,
         options: dict[str, str],
         storage_options: dict[str, str],
+        *,
+        sync_profile: str | None = None,
     ) -> None: ...
+    @property
+    def supports_guarded_sync(self) -> bool: ...
     def load_table(self, identifier: tuple[str, ...]) -> RawDeltaTable: ...
     def register_table(
         self, identifier: tuple[str, ...], location: str
     ) -> tuple[
         Literal["created", "already_registered"], RawDeltaTable, str | None, str
     ]: ...
+    def sync_table_metadata(
+        self, identifier: tuple[str, ...]
+    ) -> tuple[Literal["updated", "unchanged", "superseded"], int, str, int, str]: ...
 
 class RawDeltaTable:
     schema: Any

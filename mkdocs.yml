@@ -56,6 +56,7 @@ nav:
       - Overview: usage/overview.md
       - Creating a table: usage/create-delta-lake-table.md
       - Loading a table: usage/loading-table.md
+      - Syncing catalog metadata: usage/catalog-metadata-sync.md
       - Append/overwrite tables: usage/appending-overwriting-delta-lake-table.md
       - Adding a constraint: usage/constraints.md
       - Reading Change Data: usage/read-cdf.md
