@@ -35,8 +35,10 @@ native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
 
 [dev-dependencies]
+aws-sdk-sts = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
+deltalake-aws = { path = "../aws", default-features = false }
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

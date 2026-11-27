@@ -23,6 +23,8 @@ use deltalake_core::logstore::{
 use serde_json::{Value, json};
 use url::Url;
 
+mod qualification;
+
 const LOCATION: &str = "s3://catalog-test-bucket/warehouse/orders/";
 const ACCOUNT: &str = "123456789012";
 const DELTA_ID: &str = "3dd380f6-4f85-466a-b337-81a1b13b2d2e";
@@ -50,8 +52,8 @@ impl GlueConnector {
         })))
     }
 
-    fn catalog(&self) -> GlueDataCatalog {
-        let config = SdkConfig::builder()
+    fn sdk_config(&self) -> SdkConfig {
+        SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new("us-east-1"))
             .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
@@ -65,8 +67,11 @@ impl GlueConnector {
                 self.clone(),
             ))
             .retry_config(RetryConfig::standard().with_max_attempts(3))
-            .build();
-        GlueDataCatalog::with_config(&config).with_catalog_id(ACCOUNT)
+            .build()
+    }
+
+    fn catalog(&self) -> GlueDataCatalog {
+        GlueDataCatalog::with_config(&self.sdk_config()).with_catalog_id(ACCOUNT)
     }
 
     fn calls(&self) -> Vec<(String, Value)> {
