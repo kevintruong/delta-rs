@@ -59,6 +59,7 @@ const STORE_NAME: &str = "UnityCatalogObjectStore";
 pub mod datafusion;
 pub mod models;
 pub mod prelude;
+mod registration;
 mod sorted_listing;
 
 /// Possible errors from the unity-catalog/tables API call
@@ -680,6 +681,7 @@ impl UnityCatalogBuilder {
             client_options.allow_http = true;
         }
         let client = client_options.client()?;
+        let create_client = client_options.create_client()?;
 
         let (cc_client, update_client) =
             if let CredentialProvider::BearerToken(ref token) = credential {
@@ -697,6 +699,7 @@ impl UnityCatalogBuilder {
 
         Ok(UnityCatalog {
             client,
+            create_client,
             cc_client,
             update_client,
             workspace_url,
@@ -706,9 +709,14 @@ impl UnityCatalogBuilder {
     }
 }
 
-/// Databricks Unity Catalog
+/// Unity Catalog client.
+///
+/// Use this client with [`deltalake_core::data_catalog::CatalogLifecycle`] to register
+/// an existing external Delta table and load it with Unity-vended storage credentials.
+/// Identifiers supply two namespace components, the catalog and schema, plus the table name.
 pub struct UnityCatalog {
     client: reqwest_middleware::ClientWithMiddleware,
+    create_client: reqwest::Client,
     cc_client: Option<Arc<UCDeltaTableClient>>,
     update_client: Option<Arc<UCUpdateTableRestClient>>,
     credential: CredentialProvider,
@@ -1029,30 +1037,35 @@ impl UnityCatalog {
     where
         S: Into<String> + Debug,
     {
-        let token = self.get_credential().await?;
         let table_info = self
             .get_table(catalog_id, database_name, table_name)
             .await?;
-        let response = match table_info {
+        match table_info {
             GetTableResponse::Success(table) => {
-                let request = TemporaryTableCredentialsRequest::new(&table.table_id, operation);
-                Ok(self
-                    .client
-                    .post(format!(
-                        "{}/temporary-table-credentials",
-                        self.catalog_url()
-                    ))
-                    .header(AUTHORIZATION, token)
-                    .json(&request)
-                    .send()
-                    .await?)
+                self.get_table_credentials_by_id(&table.table_id, operation)
+                    .await
             }
-            GetTableResponse::Error(err) => Err(UnityCatalogError::InvalidTable {
-                error_code: err.error_code,
-                message: err.message,
-            }),
-        }?;
+            GetTableResponse::Error(err) => Err(err.into()),
+        }
+    }
 
+    async fn get_table_credentials_by_id(
+        &self,
+        table_id: &str,
+        operation: &str,
+    ) -> Result<TableTempCredentialsResponse, UnityCatalogError> {
+        let token = self.get_credential().await?;
+        let request = TemporaryTableCredentialsRequest::new(table_id, operation);
+        let response = self
+            .client
+            .post(format!(
+                "{}/temporary-table-credentials",
+                self.catalog_url()
+            ))
+            .header(AUTHORIZATION, token)
+            .json(&request)
+            .send()
+            .await?;
         Ok(response.json().await?)
     }
 }

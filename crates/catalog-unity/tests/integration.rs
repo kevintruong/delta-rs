@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use deltalake_catalog_unity::models::*;
 use deltalake_catalog_unity::{UnityCatalog, UnityCatalogBuilder};
+use deltalake_core::data_catalog::{
+    CatalogLifecycle, CatalogLifecycleError, RegistrationOutcome, TableIdentifier,
+};
 use deltalake_core::{DataCatalog, DeltaTable, DeltaTableBuilder};
 use deltalake_test::utils::TestTables;
 use reqwest::Url;
@@ -230,6 +233,98 @@ async fn read_table_on_local_file_system() {
     let table = server.load_table("simple").await;
     assert_eq!(table.version(), Some(4));
     assert_eq!(table.get_file_uris().unwrap().count(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_registers_and_loads_existing_delta_table() {
+    let server = UnityCatalogServer::start().await;
+    let client = server.client();
+    let id = TableIdentifier::new(
+        vec![CATALOG.to_owned(), SCHEMA.to_owned()],
+        "lifecycle_partitioned",
+    )
+    .unwrap();
+    let path = TestTables::Delta0_8_0Partitioned.as_path();
+    let log_path = path.join("_delta_log/00000000000000000000.json");
+    let log_before = std::fs::read(&log_path).unwrap();
+    let location = Url::from_directory_path(path).unwrap();
+    let lifecycle = CatalogLifecycle::new(client);
+
+    let initial = lifecycle
+        .register_table(&id, location.clone())
+        .await
+        .unwrap();
+    assert!(matches!(initial, RegistrationOutcome::Created(_)));
+    let existing = lifecycle.register_table(&id, location).await.unwrap();
+    assert!(matches!(
+        existing,
+        RegistrationOutcome::AlreadyRegistered(_)
+    ));
+    let loaded = lifecycle.load_table(&id).await.unwrap();
+    assert_eq!(loaded.entry().read_url().scheme(), "uc");
+    assert_eq!(loaded.table().version(), Some(0));
+    assert_eq!(loaded.table().get_file_uris().unwrap().count(), 6);
+    assert_eq!(log_before, std::fs::read(log_path).unwrap());
+    let GetTableResponse::Success(entry) = server
+        .client()
+        .get_table(CATALOG, SCHEMA, "lifecycle_partitioned")
+        .await
+        .unwrap()
+    else {
+        panic!("expected a registered catalog table");
+    };
+    assert_eq!(entry.columns[1].name, "year");
+    assert_eq!(entry.columns[1].partition_index, Some(0));
+    assert_eq!(
+        entry
+            .properties
+            .get("delta-rs.table-id")
+            .map(String::as_str),
+        Some(loaded.metadata().id())
+    );
+
+    let different_location = Url::from_directory_path(TestTables::Simple.as_path()).unwrap();
+    assert!(matches!(
+        lifecycle.register_table(&id, different_location).await,
+        Err(CatalogLifecycleError::Conflict { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_rejects_replaced_delta_log_at_registered_location() {
+    let server = UnityCatalogServer::start().await;
+    let id = TableIdentifier::new(
+        vec![CATALOG.to_owned(), SCHEMA.to_owned()],
+        "replaced_delta_log",
+    )
+    .unwrap();
+    let fixture = TestTables::Delta0_8_0Partitioned.as_path();
+    let log_name = "_delta_log/00000000000000000000.json";
+    let original = std::fs::read_to_string(fixture.join(log_name)).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("_delta_log")).unwrap();
+    let path = temp.path().join(log_name);
+    std::fs::write(&path, &original).unwrap();
+    let location = Url::from_directory_path(temp.path()).unwrap();
+    let lifecycle = CatalogLifecycle::new(server.client());
+
+    let RegistrationOutcome::Created(table) = lifecycle
+        .register_table(&id, location.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("expected creation of a new catalog table");
+    };
+    let updated = original.replace(
+        table.metadata().id(),
+        "41bc7f45-9963-4054-a3aa-18e399ccbb01",
+    );
+    assert_ne!(updated, original);
+    std::fs::write(path, updated).unwrap();
+    assert!(matches!(
+        lifecycle.register_table(&id, location).await,
+        Err(CatalogLifecycleError::Conflict { .. })
+    ));
 }
 
 #[cfg(feature = "datafusion")]

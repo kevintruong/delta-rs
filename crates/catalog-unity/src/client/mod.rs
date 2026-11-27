@@ -78,6 +78,33 @@ pub struct ClientOptions {
 
 impl ClientOptions {
     pub(crate) fn client(&self) -> DataCatalogResult<ClientWithMiddleware> {
+        let inner_client = self
+            .client_builder()?
+            .build()
+            .map_err(UnityCatalogError::from)?;
+        let retry_policy = self
+            .retry_config
+            .as_ref()
+            .map(|retry| retry.into())
+            .unwrap_or(ExponentialBackoff::builder().build_with_max_retries(3));
+
+        let middleware = RetryTransientMiddleware::new_with_policy(retry_policy);
+        Ok(reqwest_middleware::ClientBuilder::new(inner_client)
+            .with(middleware)
+            .build())
+    }
+
+    pub(crate) fn create_client(&self) -> DataCatalogResult<reqwest::Client> {
+        // An HTTP redirect or transport retry can replay a POST after it was applied.
+        Ok(self
+            .client_builder()?
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(UnityCatalogError::from)?)
+    }
+
+    fn client_builder(&self) -> DataCatalogResult<ClientBuilder> {
         let mut builder = ClientBuilder::new();
 
         match &self.user_agent {
@@ -134,19 +161,6 @@ impl ClientOptions {
             builder = builder.danger_accept_invalid_certs(self.allow_insecure)
         }
 
-        let inner_client = builder
-            .https_only(!self.allow_http)
-            .build()
-            .map_err(UnityCatalogError::from)?;
-        let retry_policy = self
-            .retry_config
-            .as_ref()
-            .map(|retry| retry.into())
-            .unwrap_or(ExponentialBackoff::builder().build_with_max_retries(3));
-
-        let middleware = RetryTransientMiddleware::new_with_policy(retry_policy);
-        Ok(reqwest_middleware::ClientBuilder::new(inner_client)
-            .with(middleware)
-            .build())
+        Ok(builder.https_only(!self.allow_http))
     }
 }
