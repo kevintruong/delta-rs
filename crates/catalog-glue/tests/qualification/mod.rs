@@ -1,15 +1,15 @@
-use std::error::Error;
-
 use aws_sdk_glue::Client;
 use aws_sdk_glue::config::{Builder, retry::RetryConfig};
 use aws_sdk_glue::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_glue::operation::update_table::UpdateTableError;
-use aws_sdk_glue::types::{Table, TableInput, builders::TableInputBuilder};
+use aws_sdk_glue::types::{Table, TableInput};
 
 mod live;
 mod tests;
 
-type ProbeResult<T> = Result<T, Box<dyn Error>>;
+#[path = "../support/live_glue.rs"]
+mod live_glue;
+use live_glue::{ProbeResult, Scope, copy_native_input, get_native_delta_table, version};
 
 const UNRELATED: &str = "delta-rs.qualification-unrelated";
 const FORMAT: &str = "delta-rs.sync-format";
@@ -18,14 +18,6 @@ const DIGEST: &str = "delta-rs.sync-digest";
 const PROJECTION_DESCRIPTION: &str = "delta-rs Glue qualification projection";
 const PROJECTION_VERSION: &str = "9";
 const PROJECTION_DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-
-struct Scope<'a> {
-    catalog: &'a str,
-    database: &'a str,
-    table: &'a str,
-    location: &'a str,
-    delta_id: &'a str,
-}
 
 #[derive(Debug)]
 struct Evidence {
@@ -96,61 +88,6 @@ async fn qualify_replacement(
         return Err("old VersionId changed the replacement record".into());
     }
     Ok(code)
-}
-
-async fn get_native_delta_table(client: &Client, scope: &Scope<'_>) -> ProbeResult<Table> {
-    let table = client
-        .get_table()
-        .catalog_id(scope.catalog)
-        .database_name(scope.database)
-        .name(scope.table)
-        .send()
-        .await?
-        .table
-        .ok_or("GetTable did not return the disposable entry")?;
-    if table.name() != scope.table
-        || table.database_name() != Some(scope.database)
-        || table.catalog_id() != Some(scope.catalog)
-        || table.table_type() != Some("EXTERNAL_TABLE")
-        || table.target_table().is_some()
-        || table.federated_table().is_some()
-        || table.view_definition().is_some()
-        || table.storage_descriptor().and_then(|sd| sd.location()) != Some(scope.location)
-        || !table.parameters().is_some_and(|parameters| {
-            parameters
-                .get("spark.sql.sources.provider")
-                .is_some_and(|value| value == "delta")
-                && parameters
-                    .get("delta-rs.table-id")
-                    .is_some_and(|value| value == scope.delta_id)
-        })
-    {
-        return Err("GetTable did not return a scoped native Delta registration".into());
-    }
-    Ok(table)
-}
-
-fn version(table: &Table) -> ProbeResult<&str> {
-    table
-        .version_id()
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| "GetTable omitted an observed VersionId".into())
-}
-
-fn copy_native_input(table: &Table) -> TableInputBuilder {
-    TableInput::builder()
-        .name(table.name())
-        .set_description(table.description.clone())
-        .set_owner(table.owner.clone())
-        .set_last_access_time(table.last_access_time)
-        .set_last_analyzed_time(table.last_analyzed_time)
-        .retention(table.retention)
-        .set_storage_descriptor(table.storage_descriptor.clone())
-        .set_partition_keys(table.partition_keys.clone())
-        .set_view_original_text(table.view_original_text.clone())
-        .set_view_expanded_text(table.view_expanded_text.clone())
-        .set_table_type(table.table_type.clone())
-        .set_parameters(table.parameters.clone())
 }
 
 fn compound_input(table: &Table) -> ProbeResult<TableInput> {

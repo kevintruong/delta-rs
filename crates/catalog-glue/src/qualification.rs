@@ -5,6 +5,9 @@ use serde::Deserialize;
 use super::GlueDataCatalog;
 use super::registration::provider_error;
 
+#[cfg(test)]
+mod live_test;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Report {

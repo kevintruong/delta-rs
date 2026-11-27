@@ -21,6 +21,29 @@ and loads the Delta snapshot by catalog name. It checks the binding, schema,
 Delta version, and Glue version, and deletes its generated Glue entry.
 It only reads the supplied S3 table. The normal offline suite skips live tests.
 
+## Guarded updates on a disposable table
+
+Use the same environment variables and grant Glue `UpdateTable` on the test
+database in addition to the registration permissions. Choose a stable S3 Delta
+fixture with readable version 0 and a later version containing a changed
+description, column, or partition definition. Then run:
+
+```sh
+make test-glue-guarded-live
+```
+
+The test creates a new Glue entry from the version-0 projection. The Rust
+adapter publishes the latest Delta projection with a conditional `UpdateTable`.
+The test reads it back, checks that an unrelated catalog parameter survived,
+and verifies that a repeat sync leaves the Glue version unchanged. It also
+checks that AWS rejects a stale version and that sync preserves an external
+description edit. It deletes its generated entry and only reads the S3 source.
+
+Guarded writes are enabled inside the test executable for this fixture. The
+production Rust qualification gate and the Python client's capabilities are
+unchanged. This exercise covers one continuous Glue table lifetime. Use the
+separate VersionId qualification below to test deletion and same-name replacement.
+
 ## VersionId qualification
 
 The scripted tests verify the SDK request sequence and the evidence checker. Live qualification is specific to an AWS principal, endpoint, region, catalog, database, and Lake Formation context. The Glue API documents `VersionId` and `ConcurrentModificationException`. This fixture measures their behavior on a native external Delta registration. [AWS Glue UpdateTable](https://docs.aws.amazon.com/glue/latest/webapi/API_UpdateTable.html)

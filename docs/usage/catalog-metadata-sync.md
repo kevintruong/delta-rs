@@ -14,8 +14,9 @@ Delta log is the source of truth throughout reconciliation.
 
 To exercise the Glue registration and lookup APIs against AWS, configure a
 disposable Glue database and an S3 Delta fixture, then run `make test-glue-live`.
-The separate VersionId test checks whether a deployment can safely synchronize
-metadata. [Live AWS Glue test setup](../../crates/catalog-glue/tests/qualification/README.md)
+Use `make test-glue-guarded-live` to exercise guarded metadata updates on a
+new test table. Production writes require the separate VersionId qualification.
+[Live AWS Glue test setup](../../crates/catalog-glue/tests/qualification/README.md)
 
 The `oss_rust_server_0_0_2` option enables protocol negotiation and allows
 registration to seed a projection stamp. `catalog.supports_guarded_sync` reports
