@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use url::Url;
 
-use crate::kernel::{Metadata, SchemaRef, Version};
-use crate::table::state::DeltaTableState;
+use crate::kernel::{Metadata, SchemaRef, StructType, Version};
+use crate::table::{normalize_table_url, state::DeltaTableState};
 use crate::{DeltaTable, DeltaTableError, open_table_with_storage_options};
 
 /// A result from the catalog table lifecycle API.
@@ -41,6 +41,16 @@ pub enum CatalogLifecycleError {
     #[error("catalog provider request failed")]
     Provider {
         /// Underlying provider error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A create may have been applied, but its result could not be verified.
+    #[error("unable to confirm the catalog registration outcome: {table:?}")]
+    OutcomeUnknown {
+        /// Requested table.
+        table: TableIdentifier,
+        /// Error from the create attempt or the subsequent confirmation.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -294,5 +304,158 @@ impl<B: CatalogReader> CatalogLifecycle<B> {
             return Err(CatalogLifecycleError::Conflict { table: id.clone() });
         }
         Ok(CatalogTable { entry, table })
+    }
+}
+
+/// Registration inputs derived from one committed Delta snapshot.
+#[derive(Debug)]
+pub struct TableRegistration {
+    identifier: TableIdentifier,
+    location: Url,
+    metadata: Metadata,
+    schema: SchemaRef,
+    version: Version,
+}
+
+impl TableRegistration {
+    /// Scoped table name to register.
+    pub fn identifier(&self) -> &TableIdentifier {
+        &self.identifier
+    }
+
+    /// Physical root of the existing Delta table.
+    pub fn location(&self) -> &Url {
+        &self.location
+    }
+
+    /// Metadata action from the selected committed Delta snapshot.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Schema from the selected committed Delta snapshot.
+    pub fn schema(&self) -> &StructType {
+        &self.schema
+    }
+
+    /// Version of the selected Delta snapshot.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+}
+
+/// Provider acknowledgement of an attempted create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateTableOutcome {
+    /// The provider acknowledged the create.
+    Created,
+    /// An entry with the same scoped name already exists.
+    AlreadyExists,
+    /// The provider did not establish whether the create was applied.
+    Unknown,
+}
+
+/// Creates a catalog binding without writing to the Delta log.
+#[async_trait::async_trait]
+pub trait CatalogWriter: CatalogReader {
+    /// Attempt one conditional create for the scoped name.
+    ///
+    /// A provider must preserve an existing binding and report its existence.
+    /// Report a lost acknowledgement as `Unknown` or an `OutcomeUnknown`
+    /// error with the original cause. Other errors are treated as definitive.
+    async fn create_table(
+        &self,
+        registration: &TableRegistration,
+    ) -> CatalogResult<CreateTableOutcome>;
+}
+
+/// Successfully reconciled outcome of an external table registration.
+#[derive(Debug)]
+pub enum RegistrationOutcome {
+    /// The provider acknowledged creation and a fresh lookup verified the binding.
+    Created(CatalogTable),
+    /// A matching binding exists, without an acknowledgement that this call created it.
+    AlreadyRegistered(CatalogTable),
+}
+
+impl<B: CatalogWriter> CatalogLifecycle<B> {
+    /// Register an existing Delta table and verify the resulting catalog binding.
+    ///
+    /// A repeated registration of the same binding is idempotent. After a create
+    /// attempt, the service reads the binding back without replaying the mutation.
+    pub async fn register_table(
+        &self,
+        id: &TableIdentifier,
+        location: Url,
+    ) -> CatalogResult<RegistrationOutcome> {
+        validate_location(&location)?;
+        let source =
+            open_table_with_storage_options(location.clone(), self.storage_options.clone()).await?;
+        let snapshot = source.snapshot()?;
+        let registration = TableRegistration {
+            identifier: id.clone(),
+            location,
+            metadata: snapshot.metadata().clone(),
+            schema: snapshot.schema(),
+            version: snapshot.version(),
+        };
+
+        if let Some(entry) = self.backend.get_table(id).await? {
+            return self
+                .verify_registration(&registration, entry)
+                .await
+                .map(RegistrationOutcome::AlreadyRegistered);
+        }
+
+        let (created, create_error) = match self.backend.create_table(&registration).await {
+            Ok(outcome) => (outcome == CreateTableOutcome::Created, None),
+            Err(error @ CatalogLifecycleError::OutcomeUnknown { .. }) => (false, Some(error)),
+            Err(error) => return Err(error),
+        };
+        let verified = match self.backend.get_table(id).await {
+            Ok(Some(entry)) => self.verify_registration(&registration, entry).await,
+            Ok(None) => Err(CatalogLifecycleError::NotFound { table: id.clone() }),
+            Err(error) => Err(error),
+        };
+        let table = match verified {
+            Ok(table) => table,
+            Err(error @ CatalogLifecycleError::Conflict { .. }) => return Err(error),
+            Err(error) => {
+                return Err(create_error.unwrap_or_else(|| {
+                    CatalogLifecycleError::OutcomeUnknown {
+                        table: id.clone(),
+                        source: Box::new(error),
+                    }
+                }));
+            }
+        };
+
+        Ok(if created {
+            RegistrationOutcome::Created(table)
+        } else {
+            RegistrationOutcome::AlreadyRegistered(table)
+        })
+    }
+
+    async fn verify_registration(
+        &self,
+        registration: &TableRegistration,
+        entry: CatalogEntry,
+    ) -> CatalogResult<CatalogTable> {
+        let expected_id = registration.metadata().id();
+        let id = registration.identifier();
+        if normalize_table_url(entry.location()) != normalize_table_url(registration.location())
+            || entry
+                .delta_id()
+                .is_some_and(|delta_id| delta_id != expected_id)
+        {
+            return Err(CatalogLifecycleError::Conflict { table: id.clone() });
+        }
+
+        let table = self.load_entry(id, entry).await?;
+        if table.metadata().id() != expected_id {
+            return Err(CatalogLifecycleError::Conflict { table: id.clone() });
+        }
+        Ok(table)
     }
 }

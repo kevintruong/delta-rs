@@ -6,7 +6,8 @@ mod lifecycle;
 
 pub use lifecycle::{
     CatalogEntry, CatalogLifecycle, CatalogLifecycleError, CatalogReader, CatalogResult,
-    CatalogTable, TableIdentifier,
+    CatalogTable, CatalogWriter, CreateTableOutcome, RegistrationOutcome, TableIdentifier,
+    TableRegistration,
 };
 
 #[cfg(feature = "datafusion")]
@@ -70,3 +71,6 @@ pub trait DataCatalog: Send + Sync + Debug {
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod registration_tests;

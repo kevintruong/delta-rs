@@ -16,7 +16,7 @@ impl CatalogReader for FixedCatalog {
     }
 }
 
-async fn create_table(location: &Url) -> crate::DeltaTable {
+pub(super) async fn create_table(location: &Url) -> crate::DeltaTable {
     CreateBuilder::new()
         .with_location(location.as_str())
         .with_columns([
