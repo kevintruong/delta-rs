@@ -4,7 +4,7 @@ use std::error::Error;
 use aws_sdk_glue::config::{Builder, retry::RetryConfig};
 use aws_sdk_glue::error::SdkError;
 use aws_sdk_glue::operation::create_table::CreateTableError;
-use aws_sdk_glue::types::{Column, SerDeInfo, StorageDescriptor, TableInput};
+use aws_sdk_glue::types::{Column, SerDeInfo, StorageDescriptor, Table, TableInput};
 use deltalake_core::data_catalog::{
     CatalogEntry, CatalogLifecycleError, CatalogReader, CatalogResult, CatalogWriter,
     CreateTableOutcome, TableIdentifier, TableRegistration,
@@ -12,11 +12,12 @@ use deltalake_core::data_catalog::{
 use deltalake_core::kernel::{DataType, PrimitiveType, StructField, StructType};
 use url::Url;
 
+use crate::sync::{GlueMetadataProjection, stamp_parameters};
 use crate::{GlueDataCatalog, GlueError, PLACEHOLDER_SUFFIX};
 
 const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
-const DELTA_PROVIDER: &str = "spark.sql.sources.provider";
-const DELTA_ID: &str = "delta-rs.table-id";
+pub(super) const DELTA_PROVIDER: &str = "spark.sql.sources.provider";
+pub(super) const DELTA_ID: &str = "delta-rs.table-id";
 
 #[derive(Debug, thiserror::Error)]
 enum ProjectionError {
@@ -29,9 +30,20 @@ enum ProjectionError {
 #[async_trait::async_trait]
 impl CatalogReader for GlueDataCatalog {
     async fn get_table(&self, id: &TableIdentifier) -> CatalogResult<Option<CatalogEntry>> {
+        self.read_external_table(id)
+            .await
+            .map(|record| record.map(|(_, entry)| entry))
+    }
+}
+
+impl GlueDataCatalog {
+    pub(super) async fn read_external_table(
+        &self,
+        id: &TableIdentifier,
+    ) -> CatalogResult<Option<(Table, CatalogEntry)>> {
         let database = glue_database(id)?;
         let response = self
-            .client
+            .client_for_database(database)
             .get_table()
             .set_catalog_id(self.catalog_id.clone())
             .database_name(database)
@@ -50,7 +62,7 @@ impl CatalogReader for GlueDataCatalog {
             }
             Err(error) => return Err(provider_error(error)),
         };
-        let table = response.table().ok_or_else(|| missing_metadata("Table"))?;
+        let table = response.table.ok_or_else(|| missing_metadata("Table"))?;
         let conflict = || CatalogLifecycleError::Conflict { table: id.clone() };
         if table.name() != id.name()
             || table.database_name().is_some_and(|name| name != database)
@@ -106,7 +118,7 @@ impl CatalogReader for GlueDataCatalog {
         if let Some(delta_id) = parameters.get(DELTA_ID) {
             entry = entry.with_delta_id(delta_id);
         }
-        Ok(Some(entry))
+        Ok(Some((table, entry)))
     }
 }
 
@@ -119,12 +131,12 @@ impl CatalogWriter for GlueDataCatalog {
         let id = registration.identifier();
         let database = glue_database(id)?;
         validate_s3(registration.location())?;
-        let input = table_input(registration)?;
+        let input = table_input(registration, self.qualified_for(database).is_some())?;
 
         // The lifecycle reconciles ambiguous creates by reading the binding. Limit
         // this operation to one attempt independently of the client's read policy.
         let response = self
-            .client
+            .client_for_database(database)
             .create_table()
             .set_catalog_id(self.catalog_id.clone())
             .database_name(database)
@@ -166,7 +178,7 @@ fn ambiguous_create(error: &SdkError<CreateTableError>) -> bool {
     }
 }
 
-fn glue_database(id: &TableIdentifier) -> CatalogResult<&str> {
+pub(super) fn glue_database(id: &TableIdentifier) -> CatalogResult<&str> {
     let [database] = id.namespace() else {
         return Err(CatalogLifecycleError::InvalidIdentifier);
     };
@@ -191,10 +203,53 @@ fn validate_s3(location: &Url) -> CatalogResult<()> {
     Ok(())
 }
 
-fn table_input(registration: &TableRegistration) -> CatalogResult<TableInput> {
+fn table_input(registration: &TableRegistration, seed_sync: bool) -> CatalogResult<TableInput> {
     let metadata = registration.metadata();
-    let schema = registration.schema();
-    let partition_names = metadata.partition_columns();
+    let projection = GlueMetadataProjection::from_delta(
+        registration.schema(),
+        metadata.partition_columns(),
+        metadata.description(),
+    )?;
+    let location = registration.location().as_str();
+    let mut parameters = std::collections::HashMap::from([
+        ("EXTERNAL".to_owned(), "TRUE".to_owned()),
+        (DELTA_PROVIDER.to_owned(), "delta".to_owned()),
+        (DELTA_ID.to_owned(), metadata.id().to_owned()),
+    ]);
+    if seed_sync {
+        let stamp = deltalake_core::data_catalog::CatalogProjectionStamp::new(
+            deltalake_core::data_catalog::CATALOG_PROJECTION_FORMAT_VERSION,
+            metadata.id(),
+            registration.version(),
+            projection.digest()?,
+        )?;
+        stamp_parameters(&mut parameters, &stamp);
+    }
+    let descriptor = StorageDescriptor::builder()
+        .location(location)
+        .set_columns(Some(projection.columns))
+        .serde_info(
+            SerDeInfo::builder()
+                .parameters("path", location)
+                .parameters("serialization.format", "1")
+                .build(),
+        )
+        .build();
+    TableInput::builder()
+        .name(registration.identifier().name())
+        .set_description(projection.description)
+        .table_type(EXTERNAL_TABLE)
+        .set_parameters(Some(parameters))
+        .storage_descriptor(descriptor)
+        .set_partition_keys(Some(projection.partitions))
+        .build()
+        .map_err(provider_error)
+}
+
+pub(super) fn project_columns(
+    schema: &StructType,
+    partition_names: &[String],
+) -> CatalogResult<(Vec<Column>, Vec<Column>)> {
     validate_column_names(schema).map_err(provider_error)?;
     let columns = schema
         .fields()
@@ -211,29 +266,7 @@ fn table_input(registration: &TableRegistration) -> CatalogResult<TableInput> {
             glue_column(field)
         })
         .collect::<CatalogResult<Vec<_>>>()?;
-    let location = registration.location().as_str();
-
-    let descriptor = StorageDescriptor::builder()
-        .location(location)
-        .set_columns(Some(columns))
-        .serde_info(
-            SerDeInfo::builder()
-                .parameters("path", location)
-                .parameters("serialization.format", "1")
-                .build(),
-        )
-        .build();
-    TableInput::builder()
-        .name(registration.identifier().name())
-        .set_description(metadata.description().map(str::to_owned))
-        .table_type(EXTERNAL_TABLE)
-        .parameters("EXTERNAL", "TRUE")
-        .parameters(DELTA_PROVIDER, "delta")
-        .parameters(DELTA_ID, metadata.id())
-        .storage_descriptor(descriptor)
-        .set_partition_keys(Some(partitions))
-        .build()
-        .map_err(provider_error)
+    Ok((columns, partitions))
 }
 
 fn validate_column_names(schema: &StructType) -> Result<(), ProjectionError> {
@@ -317,7 +350,7 @@ fn unsupported_column(name: &str) -> CatalogLifecycleError {
     provider_error(ProjectionError::UnsupportedColumn(name.to_owned()))
 }
 
-fn provider_error(error: impl Error + Send + Sync + 'static) -> CatalogLifecycleError {
+pub(super) fn provider_error(error: impl Error + Send + Sync + 'static) -> CatalogLifecycleError {
     CatalogLifecycleError::Provider {
         source: Box::new(error),
     }

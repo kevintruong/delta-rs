@@ -25,7 +25,11 @@ aws-sdk-glue = { version = "1.120", default-features = false, features = [
     # Use the new default HTTPS client stack (no hyper 0.14).
     "default-https-client",
 ] }
+aws-sdk-sts = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 deltalake-core = { version = "2.0", path = "../core", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
 thiserror = { workspace = true }
 url.workspace = true
 
@@ -35,11 +39,9 @@ native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
 
 [dev-dependencies]
-aws-sdk-sts = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 deltalake-aws = { path = "../aws", default-features = false }
-serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

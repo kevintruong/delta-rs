@@ -6,7 +6,9 @@
 use aws_config::{BehaviorVersion, SdkConfig};
 use deltalake_core::data_catalog::{DataCatalog, DataCatalogError};
 
+mod qualification;
 mod registration;
+mod sync;
 
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
@@ -38,7 +40,9 @@ impl From<GlueError> for DataCatalogError {
 /// A Glue Data Catalog implement of the `Catalog` trait
 pub struct GlueDataCatalog {
     client: aws_sdk_glue::Client,
+    sdk_config: SdkConfig,
     catalog_id: Option<String>,
+    qualified_sync: Option<qualification::QualifiedGlue>,
 }
 
 impl GlueDataCatalog {
@@ -53,7 +57,9 @@ impl GlueDataCatalog {
         let client = aws_sdk_glue::Client::new(config);
         Self {
             client,
+            sdk_config: config.clone(),
             catalog_id: None,
+            qualified_sync: None,
         }
     }
 
