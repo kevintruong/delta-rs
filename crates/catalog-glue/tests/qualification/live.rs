@@ -8,7 +8,9 @@ use aws_sdk_glue::config::{Region, retry::RetryConfig};
 use aws_sdk_glue::error::SdkError;
 use aws_sdk_glue::operation::get_table::GetTableError;
 use deltalake_catalog_glue::GlueDataCatalog;
-use deltalake_core::data_catalog::{CatalogLifecycle, RegistrationOutcome, TableIdentifier};
+use deltalake_core::data_catalog::{
+    CatalogLifecycle, CatalogTable, RegistrationOutcome, TableIdentifier,
+};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -20,6 +22,21 @@ use super::{
 #[tokio::test]
 #[ignore = "requires explicit authorization for a disposable AWS Glue catalog entry"]
 async fn live_glue_version_id_qualification() -> ProbeResult<()> {
+    run_live(LiveCheck::VersionId).await
+}
+
+#[tokio::test]
+#[ignore = "requires explicit authorization for a disposable AWS Glue catalog entry"]
+async fn live_glue_registration_and_load() -> ProbeResult<()> {
+    run_live(LiveCheck::Registration).await
+}
+
+enum LiveCheck {
+    Registration,
+    VersionId,
+}
+
+async fn run_live(check: LiveCheck) -> ProbeResult<()> {
     let profile = required("DELTA_RS_GLUE_CAS_PROFILE")?;
     let region = required("DELTA_RS_GLUE_CAS_REGION")?;
     if !region
@@ -75,7 +92,7 @@ async fn live_glue_version_id_qualification() -> ProbeResult<()> {
                 ("AWS_REGION".to_owned(), region.clone()),
             ]));
     eprintln!(
-        "Glue qualification target {catalog}/{database}/{name}, region={region}, profile={profile}, aws-sdk-glue={sdk_revision}"
+        "Glue live test target {catalog}/{database}/{name}, region={region}, profile={profile}, aws-sdk-glue={sdk_revision}"
     );
     let RegistrationOutcome::Created(registered) =
         lifecycle.register_table(&identifier, location).await?
@@ -90,7 +107,13 @@ async fn live_glue_version_id_qualification() -> ProbeResult<()> {
         delta_id: registered.metadata().id(),
     };
 
-    let result = run_live_probe(&client, &scope).await;
+    let (evidence_source, result) = match check {
+        LiveCheck::Registration => (
+            "aws-live-registration",
+            verify_registration(&client, &scope, &lifecycle, &registered).await,
+        ),
+        LiveCheck::VersionId => ("aws-live", run_live_probe(&client, &scope).await),
+    };
     let cleanup = delete_owned_table(&client, &scope).await;
     match (result, cleanup) {
         (Ok(observations), Ok(())) => {
@@ -98,7 +121,7 @@ async fn live_glue_version_id_qualification() -> ProbeResult<()> {
                 "{}",
                 json!({
                     "format_version": 1,
-                    "evidence_source": "aws-live",
+                    "evidence_source": evidence_source,
                     "profile": profile,
                     "account_id": account,
                     "catalog_id": catalog,
@@ -116,6 +139,41 @@ async fn live_glue_version_id_qualification() -> ProbeResult<()> {
             Err(format!("{probe}. Cleanup also failed ({cleanup})").into())
         }
     }
+}
+
+async fn verify_registration(
+    client: &Client,
+    scope: &Scope<'_>,
+    lifecycle: &CatalogLifecycle<GlueDataCatalog>,
+    registered: &CatalogTable,
+) -> ProbeResult<Value> {
+    let before = get_native_delta_table(client, scope).await?;
+    let entry = registered.entry();
+    let RegistrationOutcome::AlreadyRegistered(repeated) = lifecycle
+        .register_table(entry.identifier(), entry.location().clone())
+        .await?
+    else {
+        return Err("repeated registration created a second binding".into());
+    };
+    let loaded = lifecycle.load_table(entry.identifier()).await?;
+    for observed in [repeated, loaded] {
+        if observed.entry() != entry
+            || observed.metadata().id() != registered.metadata().id()
+            || observed.version() != registered.version()
+            || observed.schema() != registered.schema()
+        {
+            return Err("catalog lookup did not preserve the registered Delta snapshot".into());
+        }
+    }
+    let after = get_native_delta_table(client, scope).await?;
+    if version(&before)? != version(&after)? {
+        return Err("registration retry or lookup changed the Glue table version".into());
+    }
+    Ok(json!({
+        "delta_version": registered.version(),
+        "glue_version_id": version(&after)?,
+        "repeated_registration": "already_registered",
+    }))
 }
 
 async fn run_live_probe(client: &Client, scope: &Scope<'_>) -> ProbeResult<Value> {

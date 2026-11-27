@@ -1,4 +1,27 @@
-# Glue VersionId qualification
+# Live AWS Glue tests
+
+## Registration and lookup
+
+From the repository root, use a disposable Glue database and a readable S3
+Delta table in the same region. Keep the Delta snapshot stable during the test.
+Choose a profile with STS identity access, permission to read the Delta log,
+and Glue `CreateTable`, `GetTable`, and `DeleteTable` on the test database.
+
+```sh
+export DELTA_RS_GLUE_CAS_PROFILE=qualification
+export DELTA_RS_GLUE_CAS_REGION=us-east-1
+export DELTA_RS_GLUE_CAS_CATALOG=123456789012
+export DELTA_RS_GLUE_CAS_DATABASE=disposable_glue_database
+export DELTA_RS_GLUE_CAS_DELTA_URI=s3://disposable-bucket/fixtures/delta-table
+make test-glue-live
+```
+
+The test registers a uniquely named external table, repeats registration,
+and loads the Delta snapshot by catalog name. It checks the binding, schema,
+Delta version, and Glue version, and deletes its generated Glue entry.
+It only reads the supplied S3 table. The normal offline suite skips live tests.
+
+## VersionId qualification
 
 The scripted tests verify the SDK request sequence and the evidence checker. Live qualification is specific to an AWS principal, endpoint, region, catalog, database, and Lake Formation context. The Glue API documents `VersionId` and `ConcurrentModificationException`. This fixture measures their behavior on a native external Delta registration. [AWS Glue UpdateTable](https://docs.aws.amazon.com/glue/latest/webapi/API_UpdateTable.html)
 
