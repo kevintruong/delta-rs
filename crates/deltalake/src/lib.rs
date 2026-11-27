@@ -10,6 +10,8 @@ compile_error!("You must enable at least one of the features: `rustls` or `nativ
 pub use deltalake_aws as aws;
 #[cfg(feature = "azure")]
 pub use deltalake_azure as azure;
+#[cfg(feature = "glue")]
+pub use deltalake_catalog_glue as glue_catalog;
 #[cfg(feature = "unity-experimental")]
 pub use deltalake_catalog_unity as unity_catalog;
 #[cfg(feature = "gcs")]

@@ -94,8 +94,9 @@ required-features = ["datafusion"]
 [[example]]
 name = "recordbatch-writer"
 
-[package.metadata.cargo-machete]
-ignored = ["deltalake-catalog-glue"]
+[[example]]
+name = "register_glue"
+required-features = ["glue", "s3"]
 
 [lints]
 workspace = true

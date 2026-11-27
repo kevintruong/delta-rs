@@ -1,7 +1,12 @@
 //! Glue Data Catalog.
 //!
+//! The catalog lifecycle API loads and registers external Delta tables at S3
+//! locations. Registration projects supported Hive column and partition types
+//! and confirms the binding with a fresh Glue read.
 use aws_config::{BehaviorVersion, SdkConfig};
 use deltalake_core::data_catalog::{DataCatalog, DataCatalogError};
+
+mod registration;
 
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
@@ -33,20 +38,32 @@ impl From<GlueError> for DataCatalogError {
 /// A Glue Data Catalog implement of the `Catalog` trait
 pub struct GlueDataCatalog {
     client: aws_sdk_glue::Client,
+    catalog_id: Option<String>,
 }
 
 impl GlueDataCatalog {
     /// Creates a new GlueDataCatalog with environmental configuration
     pub async fn from_env() -> Result<Self, GlueError> {
         let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-        let client = aws_sdk_glue::Client::new(&config);
-        Ok(Self { client })
+        Ok(Self::with_config(&config))
     }
 
     /// Create a new [GlueDataCatalog] with the given [aws_config::SdkConfig]
     pub fn with_config(config: &SdkConfig) -> Self {
         let client = aws_sdk_glue::Client::new(config);
-        Self { client }
+        Self {
+            client,
+            catalog_id: None,
+        }
+    }
+
+    /// Scope lifecycle operations to this Glue Data Catalog ID.
+    ///
+    /// By default, Glue uses the account configured on the AWS SDK client.
+    /// The URI-only lookup method also accepts a per-call override.
+    pub fn with_catalog_id(mut self, catalog_id: impl Into<String>) -> Self {
+        self.catalog_id = Some(catalog_id.into());
+        self
     }
 }
 
@@ -76,7 +93,7 @@ impl DataCatalog for GlueDataCatalog {
             .database_name(database_name)
             .name(table_name);
 
-        if let Some(catalog) = catalog_id {
+        if let Some(catalog) = catalog_id.or_else(|| self.catalog_id.clone()) {
             builder = builder.catalog_id(catalog);
         }
 

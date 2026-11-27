@@ -2,6 +2,14 @@
 
 use std::fmt::Debug;
 
+mod lifecycle;
+
+pub use lifecycle::{
+    CatalogEntry, CatalogLifecycle, CatalogLifecycleError, CatalogReader, CatalogResult,
+    CatalogTable, CatalogWriter, CreateTableOutcome, RegistrationOutcome, TableIdentifier,
+    TableRegistration,
+};
+
 #[cfg(feature = "datafusion")]
 pub mod storage;
 
@@ -60,3 +68,9 @@ pub trait DataCatalog: Send + Sync + Debug {
         table_name: &str,
     ) -> Result<String, Self::Error>;
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
+mod registration_tests;
