@@ -57,10 +57,16 @@ pub mod credential;
 const STORE_NAME: &str = "UnityCatalogObjectStore";
 #[cfg(feature = "datafusion")]
 pub mod datafusion;
+// Integration qualification compiles the same private wire client with fixture helpers.
+#[cfg_attr(test, allow(dead_code))]
+mod external_metadata;
 pub mod models;
 pub mod prelude;
 mod registration;
 mod sorted_listing;
+mod sync;
+
+pub use sync::UnitySyncProfile;
 
 /// Possible errors from the unity-catalog/tables API call
 #[derive(thiserror::Error, Debug)]
@@ -705,6 +711,8 @@ impl UnityCatalogBuilder {
             workspace_url,
             credential,
             table_cache: DashMap::new(),
+            binding_revisions: DashMap::new(),
+            sync_origin: None,
         })
     }
 }
@@ -721,10 +729,30 @@ pub struct UnityCatalog {
     update_client: Option<Arc<UCUpdateTableRestClient>>,
     credential: CredentialProvider,
     workspace_url: String,
-    table_cache: DashMap<String, GetTableResponse>,
+    table_cache: DashMap<String, (u64, GetTableResponse)>,
+    binding_revisions: DashMap<String, u64>,
+    sync_origin: Option<Url>,
 }
 
 impl UnityCatalog {
+    fn binding_revision(&self, full_name: &str) -> u64 {
+        self.binding_revisions
+            .get(&full_name.to_lowercase())
+            .map_or(0, |revision| *revision)
+    }
+
+    fn invalidate_table(&self, full_name: &str) {
+        let canonical_name = full_name.to_lowercase();
+        *self
+            .binding_revisions
+            .entry(canonical_name.clone())
+            .or_insert(0) += 1;
+        self.table_cache.remove(full_name);
+        if canonical_name != full_name {
+            self.table_cache.remove(&canonical_name);
+        }
+    }
+
     async fn get_credential(&self) -> Result<HeaderValue, UnityCatalogError> {
         match &self.credential {
             CredentialProvider::BearerToken(token) => {
@@ -982,12 +1010,14 @@ impl UnityCatalog {
             table_name.into()
         );
 
-        if let Some(table) = self.table_cache.get(&full_path) {
+        let revision = self.binding_revision(&full_path);
+        if let Some(table) = self.table_cache.get(&full_path)
+            && table.0 == revision
+        {
             tracing::event!(tracing::Level::DEBUG, "Table cache hit: {}", full_path);
-            return Ok(table.clone());
-        } else {
-            tracing::event!(tracing::Level::DEBUG, "Getting table: {}", full_path);
+            return Ok(table.1.clone());
         }
+        tracing::event!(tracing::Level::DEBUG, "Getting table: {}", full_path);
         let token = self.get_credential().await?;
         let resp = self
             .client
@@ -996,7 +1026,8 @@ impl UnityCatalog {
             .send()
             .await?;
         let table: GetTableResponse = resp.json().await?;
-        self.table_cache.insert(full_path, table.clone());
+        self.table_cache
+            .insert(full_path, (revision, table.clone()));
         Ok(table)
     }
 
@@ -1339,6 +1370,63 @@ mod tests {
     use crate::credential::TokenCredential;
     use reqwest_middleware::ClientWithMiddleware;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn invalidated_binding_ignores_a_late_cached_response() {
+        use crate::models::GetTableResponse;
+        use httpmock::prelude::*;
+        use serde_json::json;
+
+        let server = MockServer::start_async().await;
+        let fresh = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/api/2.1/unity-catalog/tables/unity.default.orders");
+                then.status(404).json_body(json!({
+                    "error_code": "TABLE_NOT_FOUND",
+                    "message": "fresh response",
+                }));
+            })
+            .await;
+        let client = UnityCatalogBuilder::builder()
+            .workspace_url(server.base_url())
+            .bearer_token("fixture")
+            .allow_http_url(true)
+            .build()
+            .build()
+            .unwrap();
+
+        let binding = "unity.default.orders";
+        let old_revision = client.binding_revision(binding);
+        let old = GetTableResponse::Success(Default::default());
+        client
+            .table_cache
+            .insert(binding.to_owned(), (old_revision, old.clone()));
+        assert!(matches!(
+            client
+                .get_table("unity", "default", "orders")
+                .await
+                .unwrap(),
+            GetTableResponse::Success(_)
+        ));
+        fresh.assert_calls_async(0).await;
+
+        client.invalidate_table("Unity.Default.Orders");
+        // Model a suspended read that publishes its response after invalidation.
+        client
+            .table_cache
+            .insert(binding.to_owned(), (old_revision, old));
+        assert_ne!(client.binding_revision(binding), old_revision);
+        assert_eq!(client.binding_revision("unity.default.customers"), 0);
+        assert!(matches!(
+            client
+                .get_table("unity", "default", "orders")
+                .await
+                .unwrap(),
+            GetTableResponse::Error(_)
+        ));
+        fresh.assert_calls_async(1).await;
+    }
 
     #[test]
     fn test_unitycatalogbuilder_with_storage_options() {

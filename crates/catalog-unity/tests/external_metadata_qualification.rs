@@ -14,12 +14,13 @@
 //! authenticated profile rejected anonymous reads and required an external
 //! location for table creation. Java Unity and Databricks are separate profiles.
 
-#[path = "support/external_metadata.rs"]
+#[path = "../src/external_metadata.rs"]
 mod external_metadata;
 
 use std::collections::HashMap;
 
 use delta_kernel::schema::{DataType, StructField, StructType};
+use deltalake_catalog_unity::models;
 use external_metadata::{ExternalMetadataClient, Patch, QualificationError, TableName};
 use httpmock::prelude::*;
 use serde_json::{Value, json};

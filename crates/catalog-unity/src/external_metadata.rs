@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use delta_kernel::schema::StructType;
-use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url, redirect, retry};
+use reqwest::header::{AUTHORIZATION, CACHE_CONTROL, HeaderValue};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
+#[cfg(test)]
+use reqwest::{Method, redirect, retry};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -33,6 +35,7 @@ pub(super) struct ExternalMetadataClient {
 }
 
 impl ExternalMetadataClient {
+    #[cfg(test)]
     pub(super) fn new(
         origin: Url,
         authorization: Option<&str>,
@@ -67,6 +70,20 @@ impl ExternalMetadataClient {
         })
     }
 
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn from_catalog(
+        origin: Url,
+        client: Client,
+        mut authorization: HeaderValue,
+    ) -> Self {
+        authorization.set_sensitive(true);
+        Self {
+            origin,
+            client,
+            authorization: Some(authorization),
+        }
+    }
+
     pub(super) async fn negotiate(
         &self,
         table: TableName,
@@ -75,7 +92,11 @@ impl ExternalMetadataClient {
         url.query_pairs_mut()
             .append_pair("catalog", &table.catalog)
             .append_pair("protocol-versions", VERSION);
-        let response = self.authorize(self.client.get(url)).send().await?;
+        let response = self
+            .authorize(self.client.get(url))
+            .header(CACHE_CONTROL, "no-cache")
+            .send()
+            .await?;
         let status = response.status();
         if matches!(
             status,
@@ -117,6 +138,7 @@ impl ExternalMetadataClient {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn tables_request(
         &self,
         method: Method,
@@ -211,6 +233,7 @@ impl MetadataSession {
         let response = self
             .client
             .authorize(self.client.client.get(self.delta.clone()))
+            .header(CACHE_CONTROL, "no-cache")
             .send()
             .await?;
         Observation::read(response, &self.delta).await
@@ -255,12 +278,18 @@ impl MetadataSession {
         Ok(updated)
     }
 
-    pub(super) async fn tables_readback(&self) -> Result<TablesRecord, QualificationError> {
-        let response = self
+    pub(super) async fn tables_response(&self) -> Result<Response, QualificationError> {
+        Ok(self
             .client
             .authorize(self.client.client.get(self.tables.clone()))
+            .header(CACHE_CONTROL, "no-cache")
             .send()
-            .await?;
+            .await?)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn tables_readback(&self) -> Result<TablesRecord, QualificationError> {
+        let response = self.tables_response().await?;
         let table: TablesRecord = success(response)?.json().await?;
         if table.table_type != "EXTERNAL" || table.data_source_format != "DELTA" {
             return Err(QualificationError::MissingIdentity);
@@ -278,6 +307,7 @@ fn success(response: Response) -> Result<Response, QualificationError> {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Observation {
     table: Url,
     pub(super) id: Uuid,
@@ -331,6 +361,7 @@ struct ApiError {
     kind: String,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 pub(super) struct TablesRecord {
     #[serde(rename = "table_id")]
@@ -338,36 +369,47 @@ pub(super) struct TablesRecord {
     table_type: String,
     data_source_format: String,
     pub(super) comment: Option<String>,
-    pub(super) columns: Vec<deltalake_catalog_unity::models::ColumnInfo>,
+    pub(super) columns: Vec<crate::models::ColumnInfo>,
     pub(super) properties: HashMap<String, String>,
 }
 
 pub(super) struct Patch {
-    updates: [Update; 3],
+    updates: Vec<Update>,
 }
 
 impl Patch {
+    #[cfg(test)]
     pub(super) fn new(
         columns: StructType,
         comment: Option<String>,
         properties: HashMap<String, String>,
     ) -> Self {
-        Self {
-            updates: [
-                Update::Columns { columns },
-                Update::TableComment { comment },
-                Update::Properties {
-                    updates: properties,
-                },
-            ],
+        Self::from_changes(Some(columns), comment, properties)
+    }
+
+    pub(super) fn from_changes(
+        columns: Option<StructType>,
+        comment: Option<String>,
+        properties: HashMap<String, String>,
+    ) -> Self {
+        let mut updates = Vec::new();
+        if let Some(columns) = columns {
+            updates.push(Update::Columns { columns });
         }
+        if let Some(comment) = comment {
+            updates.push(Update::TableComment { comment });
+        }
+        updates.push(Update::Properties {
+            updates: properties,
+        });
+        Self { updates }
     }
 }
 
 #[derive(Serialize)]
 struct UpdateRequest<'a> {
     requirements: [Requirement<'a>; 2],
-    updates: [Update; 3],
+    updates: Vec<Update>,
 }
 
 #[derive(Serialize)]
@@ -383,7 +425,7 @@ enum Update {
     #[serde(rename = "set-columns")]
     Columns { columns: StructType },
     #[serde(rename = "set-table-comment")]
-    TableComment { comment: Option<String> },
+    TableComment { comment: String },
     #[serde(rename = "set-properties")]
     Properties { updates: HashMap<String, String> },
 }
