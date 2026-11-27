@@ -45,12 +45,25 @@ pub enum CatalogLifecycleError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// A create may have been applied, but its result could not be verified.
-    #[error("unable to confirm the catalog registration outcome: {table:?}")]
+    /// The selected catalog does not support guarded metadata synchronization.
+    #[error("guarded catalog synchronization is unsupported for: {table:?}")]
+    Unsupported {
+        /// Requested table.
+        table: TableIdentifier,
+    },
+
+    /// A revision or projection marker could not be interpreted safely.
+    #[error("invalid guarded catalog synchronization state")]
+    InvalidSyncState,
+
+    /// A catalog mutation may have been applied, but its result could not be verified.
+    #[error("unable to confirm the catalog operation outcome: {table:?}")]
     OutcomeUnknown {
         /// Requested table.
         table: TableIdentifier,
-        /// Error from the create attempt or the subsequent confirmation.
+        /// Projection dispatched by guarded sync, or `None` for registration.
+        attempted_stamp: Option<Box<super::CatalogProjectionStamp>>,
+        /// Error from the mutation attempt or the subsequent confirmation.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -255,7 +268,7 @@ impl CatalogTable {
 
 /// A provider-neutral interface to catalog tables.
 pub struct CatalogLifecycle<B> {
-    backend: B,
+    pub(super) backend: B,
     storage_options: HashMap<String, String>,
 }
 
@@ -284,7 +297,7 @@ impl<B: CatalogReader> CatalogLifecycle<B> {
         self.load_entry(id, entry).await
     }
 
-    async fn load_entry(
+    pub(super) async fn load_entry(
         &self,
         id: &TableIdentifier,
         entry: CatalogEntry,
@@ -424,6 +437,7 @@ impl<B: CatalogWriter> CatalogLifecycle<B> {
                 return Err(create_error.unwrap_or_else(|| {
                     CatalogLifecycleError::OutcomeUnknown {
                         table: id.clone(),
+                        attempted_stamp: None,
                         source: Box::new(error),
                     }
                 }));

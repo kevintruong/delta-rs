@@ -138,7 +138,7 @@ pub struct UnitySchemaProvider {
 
     /// Parent catalog for schemas of interest.
     table_names: Vec<String>,
-    table_cache: DashMap<String, Arc<dyn TableProvider>>,
+    table_cache: DashMap<String, (u64, Arc<dyn TableProvider>)>,
     token_cache: Cache<String, TemporaryTableCredentials>,
 }
 
@@ -226,9 +226,13 @@ impl SchemaProvider for UnitySchemaProvider {
         &self,
         name: &str,
     ) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        if self.table_cache.contains_key(name) {
+        let full_path = format!("{}.{}.{}", self.catalog_name, self.schema_name, name);
+        let revision = self.client.binding_revision(&full_path);
+        if let Some(table) = self.table_cache.get(name)
+            && table.0 == revision
+        {
             tracing::event!(Level::DEBUG, "Cache hit: {name}");
-            return Ok(Some(self.table_cache.get(name).unwrap().clone()));
+            return Ok(Some(table.1.clone()));
         }
         let maybe_table = self
             .client
@@ -241,7 +245,6 @@ impl SchemaProvider for UnitySchemaProvider {
                 storage_location: Some(sl),
                 ..
             }) => {
-                let full_path = format!("{}.{}.{}", self.catalog_name, self.schema_name, name);
                 let temp_creds = self
                     .token_cache
                     .try_get_with(
@@ -263,7 +266,7 @@ impl SchemaProvider for UnitySchemaProvider {
                     .await?;
                 let provider = table.table_provider().await?;
                 self.table_cache
-                    .insert(name.to_string(), Arc::clone(&provider));
+                    .insert(name.to_string(), (revision, Arc::clone(&provider)));
                 Ok(Some(provider))
             }
             GetTableResponse::Success(Table {

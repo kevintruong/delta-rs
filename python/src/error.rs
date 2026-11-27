@@ -14,6 +14,10 @@ create_exception!(_internal, TableNotFoundError, DeltaError);
 create_exception!(_internal, DeltaProtocolError, DeltaError);
 create_exception!(_internal, CommitFailedError, DeltaError);
 create_exception!(_internal, SchemaMismatchError, DeltaError);
+create_exception!(_internal, CatalogError, DeltaError);
+create_exception!(_internal, CatalogConflictError, CatalogError);
+create_exception!(_internal, CatalogUnsupportedError, CatalogError);
+create_exception!(_internal, CatalogOutcomeUnknownError, CatalogError);
 
 pub(crate) fn to_rt_err(msg: impl ToString) -> PyErr {
     PyRuntimeError::new_err(msg.to_string())

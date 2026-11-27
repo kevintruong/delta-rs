@@ -421,6 +421,15 @@ class DeltaTable:
             storage_options=storage_options,
         )
 
+    @classmethod
+    def _from_raw(
+        cls, table: RawDeltaTable, storage_options: dict[str, str]
+    ) -> DeltaTable:
+        result = cls.__new__(cls)
+        result._table = table
+        result._storage_options = storage_options
+        return result
+
     @property
     def table_config(self) -> DeltaTableConfig:
         warnings.warn(

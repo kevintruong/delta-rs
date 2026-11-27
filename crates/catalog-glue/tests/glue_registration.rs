@@ -23,6 +23,11 @@ use deltalake_core::logstore::{
 use serde_json::{Value, json};
 use url::Url;
 
+mod guarded_sync;
+mod qualification;
+
+static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const LOCATION: &str = "s3://catalog-test-bucket/warehouse/orders/";
 const ACCOUNT: &str = "123456789012";
 const DELTA_ID: &str = "3dd380f6-4f85-466a-b337-81a1b13b2d2e";
@@ -50,8 +55,8 @@ impl GlueConnector {
         })))
     }
 
-    fn catalog(&self) -> GlueDataCatalog {
-        let config = SdkConfig::builder()
+    fn sdk_config(&self) -> SdkConfig {
+        SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new("us-east-1"))
             .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
@@ -65,8 +70,11 @@ impl GlueConnector {
                 self.clone(),
             ))
             .retry_config(RetryConfig::standard().with_max_attempts(3))
-            .build();
-        GlueDataCatalog::with_config(&config).with_catalog_id(ACCOUNT)
+            .build()
+    }
+
+    fn catalog(&self) -> GlueDataCatalog {
+        GlueDataCatalog::with_config(&self.sdk_config()).with_catalog_id(ACCOUNT)
     }
 
     fn calls(&self) -> Vec<(String, Value)> {
@@ -88,19 +96,42 @@ impl HttpClient for GlueConnector {
 
 impl HttpConnector for GlueConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let target = request.headers().get("x-amz-target").unwrap().to_owned();
-        let input = serde_json::from_slice(request.body().bytes().unwrap()).unwrap();
+        let bytes = request.body().bytes().unwrap();
+        let (target, input) = match request.headers().get("x-amz-target") {
+            Some(target) => (target.to_owned(), serde_json::from_slice(bytes).unwrap()),
+            None => {
+                let query: std::collections::HashMap<_, _> =
+                    url::form_urlencoded::parse(bytes).collect();
+                assert_eq!(
+                    query.get("Action").map(|action| action.as_ref()),
+                    Some("GetCallerIdentity")
+                );
+                (
+                    "STS.GetCallerIdentity".to_owned(),
+                    serde_json::to_value(query).unwrap(),
+                )
+            }
+        };
+        let sts = target == "STS.GetCallerIdentity";
         let mut script = self.0.lock().unwrap();
         script.calls.push((target, input));
         let (status, body) = script
             .responses
             .pop_front()
             .expect("unexpected Glue request");
-        let mut response =
-            HttpResponse::new(status.try_into().unwrap(), SdkBody::from(body.to_string()));
-        response
-            .headers_mut()
-            .insert("content-type", "application/x-amz-json-1.1");
+        let (body, content_type) = if sts {
+            let account = body["Account"].as_str().unwrap();
+            (
+                format!(
+                    "<GetCallerIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><GetCallerIdentityResult><Account>{account}</Account></GetCallerIdentityResult></GetCallerIdentityResponse>"
+                ),
+                "text/xml",
+            )
+        } else {
+            (body.to_string(), "application/x-amz-json-1.1")
+        };
+        let mut response = HttpResponse::new(status.try_into().unwrap(), SdkBody::from(body));
+        response.headers_mut().insert("content-type", content_type);
         HttpConnectorFuture::new(async move { Ok(response) })
     }
 }
@@ -154,6 +185,7 @@ fn table(location: &str, provider: &str) -> Value {
 
 #[tokio::test]
 async fn registration_reconciles_one_ambiguous_create() {
+    let _fixture_lock = FIXTURE_LOCK.lock().await;
     let store = Arc::new(InMemory::new());
     let commit = Path::from("warehouse/orders/_delta_log/00000000000000000000.json");
     store.put(&commit, LOG.into()).await.unwrap();

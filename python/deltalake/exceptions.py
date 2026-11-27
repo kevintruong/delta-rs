@@ -1,4 +1,8 @@
 from deltalake._internal import (
+    CatalogConflictError,
+    CatalogError,
+    CatalogOutcomeUnknownError,
+    CatalogUnsupportedError,
     CommitFailedError,
     DeltaError,
     DeltaProtocolError,
@@ -7,6 +11,10 @@ from deltalake._internal import (
 )
 
 __all__ = [
+    "CatalogConflictError",
+    "CatalogError",
+    "CatalogOutcomeUnknownError",
+    "CatalogUnsupportedError",
     "CommitFailedError",
     "DeltaError",
     "DeltaProtocolError",

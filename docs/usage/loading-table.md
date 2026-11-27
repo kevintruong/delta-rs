@@ -60,6 +60,43 @@ properties.
     ```
 
 
+## Register and load an existing table through a catalog
+
+Use `deltalake.catalog.load_catalog` to register an existing Delta table and
+look it up by name. Registration reads a committed Delta snapshot and
+creates the external catalog entry. It leaves the Delta transaction log
+untouched.
+
+```python
+from deltalake.catalog import load_catalog
+
+catalog = load_catalog("glue")
+identifier = ("logistics", "orders")
+result = catalog.register_table(identifier, "s3://example-bucket/orders")
+assert result.status in {"created", "already_registered"}
+
+table = catalog.load_table(identifier)
+assert table.metadata().id == result.delta_id
+```
+
+| Provider | Identifier tuple | Catalog configuration | Supported registration |
+| --- | --- | --- | --- |
+| Glue | `(database, table)` | AWS SDK environment and credential chain. Set `options={"catalog_id": "..."}` to select a catalog explicitly. | External Delta table on S3 |
+| Unity | `(catalog, schema, table)` | Unity environment variables such as `DATABRICKS_HOST` and `DATABRICKS_TOKEN`. Set `options` to override the workspace or credentials. | External Delta table through the Unity Tables API |
+
+Use `storage_options` on `load_catalog` for Delta storage configuration. The
+Unity client obtains storage access through the provider. A successful
+registration result includes the loaded `DeltaTable`, the Delta table ID and
+the provider's table ID when available.
+
+Repeated registration of the same binding returns `already_registered`.
+A different binding raises `CatalogConflictError`. If the catalog mutation
+could have succeeded and its follow-up check failed,
+`CatalogOutcomeUnknownError` signals that the caller should inspect the
+current binding before proceeding. These exceptions are available from
+`deltalake.exceptions`. The regular `DeltaTable(path)` API also works
+independently of catalog registration.
+
 ## Loading and materialized metadata
 
 Normal `DeltaTable` loading collects active-file metadata and statistics in memory.

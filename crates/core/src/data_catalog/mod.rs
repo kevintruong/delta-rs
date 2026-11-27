@@ -3,11 +3,18 @@
 use std::fmt::Debug;
 
 mod lifecycle;
+mod sync;
 
 pub use lifecycle::{
     CatalogEntry, CatalogLifecycle, CatalogLifecycleError, CatalogReader, CatalogResult,
     CatalogTable, CatalogWriter, CreateTableOutcome, RegistrationOutcome, TableIdentifier,
     TableRegistration,
+};
+
+pub use sync::{
+    CATALOG_PROJECTION_FORMAT_VERSION, CatalogProjectionStamp, CatalogRevision, CatalogSyncOutcome,
+    CatalogSyncProjection, CatalogSyncState, CatalogSyncUpdate, CatalogSyncWriteOutcome,
+    CatalogSyncWriter,
 };
 
 #[cfg(feature = "datafusion")]
@@ -74,3 +81,6 @@ mod lifecycle_tests;
 
 #[cfg(test)]
 mod registration_tests;
+
+#[cfg(test)]
+mod sync_tests;

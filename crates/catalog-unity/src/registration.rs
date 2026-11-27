@@ -19,7 +19,7 @@ use crate::models::{
 };
 use crate::{StorageConfig, UnityCatalog, UnityCatalogError, build_object_store, default_logstore};
 
-const DELTA_ID_PROPERTY: &str = "delta-rs.table-id";
+pub(super) const DELTA_ID_PROPERTY: &str = "delta-rs.table-id";
 
 #[async_trait::async_trait]
 impl CatalogReader for UnityCatalog {
@@ -40,52 +40,9 @@ impl CatalogReader for UnityCatalog {
             .send()
             .await
             .map_err(provider_error)?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = reply_error(response).await;
-            if status == StatusCode::NOT_FOUND
-                && matches!(
-                    &error,
-                    UnityCatalogError::InvalidTable { error_code, .. }
-                        if matches!(error_code.as_str(), "TABLE_NOT_FOUND" | "RESOURCE_DOES_NOT_EXIST")
-                )
-            {
-                return Ok(None);
-            }
-            return Err(provider_error(error));
-        }
-
-        let table = response.json::<Table>().await.map_err(provider_error)?;
-        if table.table_type != TableType::External
-            || table.data_source_format != Some(DataSourceFormat::Delta)
-            || ![&table.catalog_name, &table.schema_name, &table.name]
-                .into_iter()
-                .zip([catalog, schema, name])
-                .all(|(actual, expected)| actual == expected || *actual == expected.to_lowercase())
-        {
-            return Err(CatalogLifecycleError::Conflict { table: id.clone() });
-        }
-
-        if table.table_id.is_empty() {
-            return Err(provider_error(
-                "Unity external Delta table is missing its table ID",
-            ));
-        }
-        let location = table
-            .storage_location
-            .as_deref()
-            .and_then(|location| Url::parse(location).ok())
-            .ok_or(CatalogLifecycleError::InvalidLocation)?;
-        let authority: String = byte_serialize(full_name.as_bytes()).collect();
-        let read_url = Url::parse(&format!("uc://{authority}")).map_err(provider_error)?;
-
-        let mut entry = CatalogEntry::new(id.clone(), location)?
-            .with_read_url(read_url)?
-            .with_provider_id(table.table_id);
-        if let Some(delta_id) = table.properties.get(DELTA_ID_PROPERTY) {
-            entry = entry.with_delta_id(delta_id);
-        }
-        Ok(Some(entry))
+        Ok(parse_external_table(id, response)
+            .await?
+            .map(|(_, entry)| entry))
     }
 
     async fn open_table(
@@ -149,6 +106,11 @@ impl CatalogWriter for UnityCatalog {
     ) -> CatalogResult<CreateTableOutcome> {
         let id = registration.identifier();
         let [catalog, schema, name] = names(id)?;
+        let mut properties = HashMap::from([(
+            DELTA_ID_PROPERTY.to_owned(),
+            registration.metadata().id().to_owned(),
+        )]);
+        self.seed_sync_stamp(registration, &mut properties).await?;
         let request = CreateExternalDelta {
             catalog_name: catalog,
             schema_name: schema,
@@ -158,10 +120,7 @@ impl CatalogWriter for UnityCatalog {
             storage_location: registration.location().as_str(),
             comment: registration.metadata().description(),
             columns: columns(registration)?,
-            properties: HashMap::from([(
-                DELTA_ID_PROPERTY.to_owned(),
-                registration.metadata().id().to_owned(),
-            )]),
+            properties,
         };
         let token = self.get_credential().await.map_err(provider_error)?;
         let result = self
@@ -172,14 +131,10 @@ impl CatalogWriter for UnityCatalog {
             .send()
             .await;
 
-        let full_name = format!("{catalog}.{schema}.{name}");
-        self.table_cache.remove(&full_name);
-        let canonical_name = full_name.to_lowercase();
-        if canonical_name != full_name {
-            self.table_cache.remove(&canonical_name);
-        }
+        self.invalidate_table(&format!("{catalog}.{schema}.{name}"));
         let unknown = |source| CatalogLifecycleError::OutcomeUnknown {
             table: id.clone(),
+            attempted_stamp: None,
             source,
         };
         let response = result.map_err(|error| unknown(error.into()))?;
@@ -204,7 +159,61 @@ impl CatalogWriter for UnityCatalog {
     }
 }
 
-fn names(id: &TableIdentifier) -> CatalogResult<[&str; 3]> {
+pub(super) async fn parse_external_table(
+    id: &TableIdentifier,
+    response: Response,
+) -> CatalogResult<Option<(Table, CatalogEntry)>> {
+    let [catalog, schema, name] = names(id)?;
+    let full_name = format!("{catalog}.{schema}.{name}");
+    if !response.status().is_success() {
+        let status = response.status();
+        let error = reply_error(response).await;
+        if status == StatusCode::NOT_FOUND
+            && matches!(
+                &error,
+                UnityCatalogError::InvalidTable { error_code, .. }
+                    if matches!(error_code.as_str(), "TABLE_NOT_FOUND" | "RESOURCE_DOES_NOT_EXIST")
+            )
+        {
+            return Ok(None);
+        }
+        return Err(provider_error(error));
+    }
+
+    let table = response.json::<Table>().await.map_err(provider_error)?;
+    if table.table_type != TableType::External
+        || table.data_source_format != Some(DataSourceFormat::Delta)
+        || ![&table.catalog_name, &table.schema_name, &table.name]
+            .into_iter()
+            .zip([catalog, schema, name])
+            .all(|(actual, expected)| actual == expected || *actual == expected.to_lowercase())
+    {
+        return Err(CatalogLifecycleError::Conflict { table: id.clone() });
+    }
+
+    if table.table_id.is_empty() {
+        return Err(provider_error(
+            "Unity external Delta table is missing its table ID",
+        ));
+    }
+    let location = table
+        .storage_location
+        .as_deref()
+        .and_then(|location| Url::parse(location).ok())
+        .ok_or(CatalogLifecycleError::InvalidLocation)?;
+    let authority: String = byte_serialize(full_name.as_bytes()).collect();
+    let read_url = Url::parse(&format!("uc://{authority}")).map_err(provider_error)?;
+
+    let mut entry = CatalogEntry::new(id.clone(), location)?
+        .with_read_url(read_url)?
+        .with_provider_id(&table.table_id);
+    if let Some(delta_id) = table.properties.get(DELTA_ID_PROPERTY) {
+        entry = entry.with_delta_id(delta_id);
+    }
+    Ok(Some((table, entry)))
+}
+
+pub(super) fn names(id: &TableIdentifier) -> CatalogResult<[&str; 3]> {
     let [catalog, schema] = id.namespace() else {
         return Err(CatalogLifecycleError::InvalidIdentifier);
     };
@@ -220,7 +229,7 @@ fn names(id: &TableIdentifier) -> CatalogResult<[&str; 3]> {
     Ok(result)
 }
 
-fn provider_error(
+pub(super) fn provider_error(
     source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> CatalogLifecycleError {
     CatalogLifecycleError::Provider {

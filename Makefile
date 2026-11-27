@@ -50,6 +50,14 @@ check: ## Run basic cargo formatting and other checks (no tests)
 	cargo clippy --features azure,datafusion,s3,gcs,glue,hdfs --tests
 	$(MAKE) -C python $@
 
+.PHONY: test-glue-live
+test-glue-live: ## Test registration and lookup against the configured AWS Glue catalog
+	cargo test -p deltalake-catalog-glue --test glue_registration -- --ignored --exact qualification::live::live_glue_registration_and_load --nocapture
+
+.PHONY: test-glue-guarded-live
+test-glue-guarded-live: ## Exercise guarded metadata updates on a newly created AWS Glue fixture
+	cargo test -p deltalake-catalog-glue --lib -- --ignored --exact qualification::live_test::live_guarded_updates --nocapture
+
 .PHONY: clean
 clean: ## Remove temporary and downloaded artifacts
 	rm -rf dat

@@ -19,6 +19,7 @@ from arro3.core.types import ArrowSchemaExportable
 if TYPE_CHECKING:
     import pyarrow.fs as fs
 
+    from deltalake.catalog import ProjectionStamp
     from deltalake.transaction import (
         AddAction,
         CommitProperties,
@@ -77,6 +78,27 @@ class CommitInfoIterator:
     def latest_version(self) -> int: ...
     def __iter__(self) -> CommitInfoIterator: ...
     def __next__(self) -> str: ...
+
+class RawCatalog:
+    def __init__(
+        self,
+        provider: str,
+        options: dict[str, str],
+        storage_options: dict[str, str],
+        *,
+        sync_profile: str | None = None,
+    ) -> None: ...
+    @property
+    def supports_guarded_sync(self) -> bool: ...
+    def load_table(self, identifier: tuple[str, ...]) -> RawDeltaTable: ...
+    def register_table(
+        self, identifier: tuple[str, ...], location: str
+    ) -> tuple[
+        Literal["created", "already_registered"], RawDeltaTable, str | None, str
+    ]: ...
+    def sync_table_metadata(
+        self, identifier: tuple[str, ...]
+    ) -> tuple[Literal["updated", "unchanged", "superseded"], int, str, int, str]: ...
 
 class RawDeltaTable:
     schema: Any
@@ -1066,6 +1088,21 @@ class DeltaError(Exception):
     """The base class for Delta-specific errors."""
 
     pass
+
+class CatalogError(DeltaError):
+    """A provider or catalog lifecycle operation failed."""
+
+class CatalogConflictError(CatalogError):
+    """The name identifies a different or incompatible table."""
+
+class CatalogOutcomeUnknownError(CatalogError):
+    """A mutation may have succeeded but its read-back could not be confirmed."""
+
+    identifier: tuple[str, ...]
+    attempted_stamp: ProjectionStamp | None
+
+class CatalogUnsupportedError(CatalogError):
+    """The catalog or selected backend cannot perform the operation."""
 
 class TableNotFoundError(DeltaError):
     """Raised when a Delta table cannot be loaded from a location."""
