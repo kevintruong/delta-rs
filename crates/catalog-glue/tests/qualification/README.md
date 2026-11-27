@@ -18,4 +18,18 @@ The probe creates the entry through the catalog registration API. It reads the c
 
 The probe recreates its entry with a distinct fixture marker and checks the original token against the replacement. A reused token fails qualification before any stale update is sent. Otherwise the original token must be rejected and the replacement must remain intact. If ownership cannot be verified during cleanup, the failure includes the generated target name printed at the start of the test.
 
-A passing live run prints a JSON record after cleanup. It includes the resolved SDK version from `Cargo.lock`, the STS account, the Glue scope, the Lake Formation registration flag, observed versions and both AWS service error codes. The JSON record applies to that exact configuration. A mock run, missing live target, or failure supplies no live qualification evidence.
+A passing live run prints a JSON record after cleanup. It includes the resolved SDK version from `Cargo.lock`, the STS account, the Glue scope, the Lake Formation registration flag, observed versions and both AWS service error codes. The JSON record applies to that exact configuration. Only a passing live run qualifies a scope for guarded writes.
+
+## Observed same-name replacement behavior
+
+An authenticated AWS CLI 2.27.14 probe used disposable external Delta catalog metadata in `ap-southeast-1` outside Lake Formation. The same probe ran against [AWS Emulator 1.0.634](https://github.com/aws/aws-emulator). The AWS probe made zero S3 calls. Both probes verified cleanup.
+
+| Probe step | AWS Glue and AWS Emulator |
+| --- | --- |
+| Update the initial entry with `VersionId` `0` | Accepted. A fresh read returned version `1`. |
+| Repeat a write with `0` against version `1` | Rejected with `ConcurrentModificationException`. The newer record was intact. |
+| Publish a column, description, and watermark with `1` | Accepted. A fresh read returned version `2` and preserved the unrelated parameter. |
+| Delete and recreate the table at the same name | The replacement reused version `0`. |
+| Write to the replacement with the original entry's `0` | Accepted. The write overwrote the replacement's metadata. |
+
+The tested AWS scope fails the same-name replacement requirement. The official emulator reproduces the failure for local regression tests. Guarded writes remain disabled for this scope.
