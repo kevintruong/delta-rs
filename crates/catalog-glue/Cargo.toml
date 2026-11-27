@@ -27,6 +27,7 @@ aws-sdk-glue = { version = "1.120", default-features = false, features = [
 ] }
 deltalake-core = { version = "2.0", path = "../core", default-features = false }
 thiserror = { workspace = true }
+url.workspace = true
 
 [features]
 default = ["rustls"]
@@ -34,6 +35,9 @@ native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
 
 [dev-dependencies]
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
