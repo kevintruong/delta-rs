@@ -49,7 +49,7 @@ async fn guarded_sync_requires_profile_and_trusted_origin() -> TestResult {
 
 #[tokio::test]
 #[ignore = "requires a disposable local Unity Delta API server"]
-async fn qualified_registration_and_sync_round_trip() -> TestResult {
+async fn registration_and_sync_respect_the_live_validator_contract() -> TestResult {
     let origin = Url::parse(&std::env::var("UC_QUALIFICATION_URL")?)?;
     let permitted = matches!(origin.host(),
         Some(url::Host::Ipv4(address)) if address.is_loopback())
@@ -93,6 +93,17 @@ async fn qualified_registration_and_sync_round_trip() -> TestResult {
         let before = read_table(&raw, &url, &token).await?;
         assert_eq!(before["properties"][VERSION], "0");
         assert_eq!(before["columns"].as_array().unwrap().len(), 1);
+        // Stock 0.0.2 has no validator on the General Tables representation.
+        let response = raw.get(url.clone()).bearer_auth(&token).send().await?.error_for_status()?;
+        if !response.headers().contains_key(reqwest::header::ETAG) {
+            let table = deltalake_core::open_table(location.clone()).await?;
+            table.add_columns().with_fields([StructField::new("carrier", DataType::STRING, true)]).await?;
+            assert!(matches!(lifecycle.sync_table_metadata(&id).await,
+                Err(CatalogLifecycleError::Unsupported { .. })));
+            assert_eq!(read_table(&raw, &url, &token).await?, before);
+            return Ok(());
+        }
+
         assert!(matches!(lifecycle.sync_table_metadata(&id).await?,
             CatalogSyncOutcome::Unchanged(stamp) if stamp.delta_version() == 0));
         let guarded = read_table(&raw, &delta_url, &token).await?;
@@ -262,12 +273,35 @@ mod mocked {
         LostAcknowledgement,
         StaleReadBack,
         StaleEtag,
+        StaleGeneral,
+        MissingValidator,
+        WeakValidator,
+        MalformedValidator,
+        MultipleValidators,
         ReboundUuid,
     }
 
     #[tokio::test]
     async fn lost_acknowledgement_uses_fresh_tables_without_replay() -> TestResult {
         exercise(Scenario::LostAcknowledgement).await
+    }
+
+    #[tokio::test]
+    async fn stale_general_fields_do_not_borrow_the_current_delta_etag() -> TestResult {
+        exercise(Scenario::StaleGeneral).await
+    }
+
+    #[tokio::test]
+    async fn general_tables_requires_one_strong_validator() -> TestResult {
+        for scenario in [
+            Scenario::MissingValidator,
+            Scenario::WeakValidator,
+            Scenario::MalformedValidator,
+            Scenario::MultipleValidators,
+        ] {
+            exercise(scenario).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -381,7 +415,26 @@ mod mocked {
                             .path(TABLES)
                             .header("authorization", TOKEN)
                             .is_true(move |_| phase_state.load(Ordering::SeqCst) == phase);
-                        then.status(200).json_body(record);
+                        let then = then.status(200).json_body(record);
+                        match scenario {
+                            Scenario::MissingValidator => {}
+                            Scenario::WeakValidator => {
+                                then.header("etag", format!(r#"W/"{etag}""#));
+                            }
+                            Scenario::MalformedValidator => {
+                                then.header("etag", &etag);
+                            }
+                            Scenario::MultipleValidators => {
+                                then.header("etag", format!(r#""{etag}""#))
+                                    .header("etag", r#""other""#);
+                            }
+                            Scenario::StaleGeneral if phase == 0 => {
+                                then.header("etag", r#""etag-older""#);
+                            }
+                            _ => {
+                                then.header("etag", format!(r#""{etag}""#));
+                            }
+                        }
                     })
                     .await,
             );
@@ -446,10 +499,30 @@ mod mocked {
                 result,
                 Err(CatalogLifecycleError::OutcomeUnknown { .. })
             )),
-            Scenario::ReboundUuid => assert!(matches!(
+            Scenario::WeakValidator
+            | Scenario::MissingValidator
+            | Scenario::MalformedValidator
+            | Scenario::MultipleValidators => assert!(matches!(
+                result,
+                Err(CatalogLifecycleError::Unsupported { .. })
+            )),
+            Scenario::ReboundUuid | Scenario::StaleGeneral => assert!(matches!(
                 result,
                 Err(CatalogLifecycleError::Conflict { .. })
             )),
+        }
+        if matches!(
+            scenario,
+            Scenario::StaleGeneral
+                | Scenario::MissingValidator
+                | Scenario::WeakValidator
+                | Scenario::MalformedValidator
+                | Scenario::MultipleValidators
+        ) {
+            first.assert_calls_async(0).await;
+            second.assert_calls_async(0).await;
+            fallback.assert_calls_async(0).await;
+            return Ok(());
         }
         first.assert_calls_async(1).await;
         second

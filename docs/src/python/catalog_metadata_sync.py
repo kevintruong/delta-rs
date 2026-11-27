@@ -1,4 +1,4 @@
-"""Publish an existing Delta table's committed schema to qualified Unity OSS."""
+"""Publish a Delta schema to Unity with a qualified shared strong validator."""
 
 import argparse
 
@@ -37,7 +37,7 @@ def main() -> None:
         result = catalog.sync_table_metadata(identifier)
     except CatalogUnsupportedError as error:
         raise SystemExit(
-            "The target lacks the qualified external metadata endpoint."
+            "The target lacks the required guarded sync capability. Stock Unity 0.0.2 omits the General Tables validator."
         ) from error
     except CatalogConflictError as error:
         raise SystemExit(

@@ -68,7 +68,7 @@ class Catalog:
 
     @property
     def supports_guarded_sync(self) -> bool:
-        """Whether this instance is configured for a qualified guarded sync profile."""
+        """Whether this instance is configured to negotiate guarded sync."""
         return self._catalog.supports_guarded_sync
 
     def load_table(self, identifier: tuple[str, ...]) -> DeltaTable:
@@ -134,7 +134,8 @@ def load_catalog(
     `workspace_url` and `access_token` or their environment equivalents.
     `storage_options` configures access to Delta storage.
 
-    Set `sync_profile` only for a matching Unity OSS Rust server 0.0.2 deployment.
+    The Unity profile negotiates guarded sync on each table. A write requires a
+    strong General Tables ETag shared with Delta. Stock 0.0.2 omits this header.
     Registration and load are available with the default configuration.
     """
     return Catalog(

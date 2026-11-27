@@ -9,7 +9,7 @@ import urllib.request
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.client import HTTPConnection
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from typing import Generator
 from urllib.parse import urlsplit
@@ -41,9 +41,15 @@ def _catalog_fault_proxy(
     *,
     first_config_status: HTTPStatus | None = None,
 ):
-    """Inject the selected fault once and forward other requests to Unity."""
+    """Serve a single-table fixture with serialized requests and a shared revision.
+
+    Its only metadata mutations are creation and the conditional Delta POST.
+    The fixture owns its revision counter and uses the native server for storage.
+    """
     target = urlsplit(server)
     counts = {"requests": 0, "writes": 0, "creates": 0, "config_reads": 0}
+    revision = 0
+    native_etag = None
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -53,6 +59,7 @@ def _catalog_fault_proxy(
             self.forward()
 
         def forward(self):
+            nonlocal native_etag, revision
             counts["requests"] += 1
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             path = urlsplit(self.path).path
@@ -73,12 +80,21 @@ def _catalog_fault_proxy(
                 if inject_fault and fault == "unknown":
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                     return
-                if inject_fault and fault == "stale_etag":
-                    payload = json.loads(body)
-                    for requirement in payload["requirements"]:
-                        if requirement["type"] == "assert-etag":
-                            requirement["etag"] = "stale-fixture-etag"
-                    body = json.dumps(payload).encode()
+                payload = json.loads(body)
+                guard = next(
+                    r for r in payload["requirements"] if r["type"] == "assert-etag"
+                )
+                if guard["etag"] != f"fixture-{revision}" or (
+                    inject_fault and fault == "stale_etag"
+                ):
+                    error = b'{"error":{"type":"UpdateRequirementConflictException"}}'
+                    self.send_response(HTTPStatus.CONFLICT)
+                    self.send_header("Content-Length", str(len(error)))
+                    self.end_headers()
+                    self.wfile.write(error)
+                    return
+                guard["etag"] = native_etag
+                body = json.dumps(payload).encode()
 
             headers = {
                 name: self.headers[name]
@@ -91,6 +107,16 @@ def _catalog_fault_proxy(
                 response = connection.getresponse()
                 response_body = response.read()
                 if (
+                    response.status == HTTPStatus.OK
+                    and "/delta/v1/catalogs/" in self.path
+                ):
+                    payload = json.loads(response_body)
+                    native_etag = payload["metadata"]["etag"]
+                    if guarded_write:
+                        revision += 1
+                    payload["metadata"]["etag"] = f"fixture-{revision}"
+                    response_body = json.dumps(payload).encode()
+                if (
                     inject_fault
                     and fault == "ack_lost"
                     and response.status == HTTPStatus.OK
@@ -98,9 +124,17 @@ def _catalog_fault_proxy(
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                     return
                 self.send_response(response.status)
-                for name in ("Content-Type", "ETag"):
-                    if response.getheader(name) is not None:
-                        self.send_header(name, response.getheader(name))
+                if (
+                    self.command == "GET"
+                    and "/unity-catalog/tables/" in self.path
+                    and response.status == HTTPStatus.OK
+                ):
+                    response_body = json.dumps(
+                        json.loads(response_body), sort_keys=True
+                    ).encode()
+                    self.send_header("ETag", f'"fixture-{revision}"')
+                if content_type := response.getheader("Content-Type"):
+                    self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(response_body)))
                 self.end_headers()
                 self.wfile.write(response_body)
@@ -110,7 +144,7 @@ def _catalog_fault_proxy(
         def log_message(self, format, *args):
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as proxy:
+    with HTTPServer(("127.0.0.1", 0), Handler) as proxy:
         thread = Thread(target=proxy.serve_forever, daemon=True)
         thread.start()
         try:
@@ -273,6 +307,14 @@ def test_catalog_guarded_sync(unity_catalog_server: str, tmp_path, fault: str):
         assert [column["name"] for column in before["columns"]] == ["order_id"]
         assert before["table_id"] == registration.provider_id
         assert before["properties"]["delta-rs.sync-version"] == "0"
+
+        stock = load_catalog(
+            "unity",
+            options={**options, "workspace_url": unity_catalog_server},
+            sync_profile="oss_rust_server_0_0_2",
+        )
+        with pytest.raises(CatalogUnsupportedError):
+            stock.sync_table_metadata(identifier)
 
         table.alter.add_columns(Field("carrier", PrimitiveType("string")))
         committed_version = DeltaTable(path).version()

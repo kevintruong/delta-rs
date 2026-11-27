@@ -8,15 +8,29 @@ Delta log is the source of truth throughout reconciliation.
 
 | Provider | Registration and load | Guarded metadata sync |
 | --- | --- | --- |
-| Unity OSS Rust server 0.0.2 | Available | External Delta tables on the explicit `oss_rust_server_0_0_2` profile using the Delta REST API 1.0 |
+| Stock Unity OSS Rust server 0.0.2 | Available | Unavailable. General Tables omits a strong HTTP ETag. |
 | Other Unity deployments | Available on compatible Unity Tables APIs | Requires separate qualification |
 | AWS Glue | Available on builds with the Glue catalog backend | Requires live AWS qualification |
 
-Select `sync_profile="oss_rust_server_0_0_2"` only for a deployment matching the
-qualified server. `catalog.supports_guarded_sync` reports whether the instance
-has a configured profile. The provider still checks the endpoint and table at
-runtime. Use the qualified instance for new registration so it can write a
-projection stamp. Existing records without a stamp require explicit adoption.
+The `oss_rust_server_0_0_2` option enables protocol negotiation and allows
+registration to seed a projection stamp. `catalog.supports_guarded_sync` reports
+whether this option was selected. Each sync checks the table at runtime.
+
+Guarded writes require the General Tables response to carry one strong HTTP
+ETag covering the full representation. Its opaque value must equal the Delta
+metadata ETag for the same table UUID. The deployment must enforce that shared
+revision atomically across every table writer. A missing, weak, or malformed
+validator produces `CatalogUnsupportedError`. A different valid revision
+produces `CatalogConflictError`. Both outcomes stop the write.
+
+Stock 0.0.2 derives the Delta ETag from a millisecond timestamp. Distinct
+General Tables edits can share that timestamp. Adding an HTTP ETag from that
+timestamp in a proxy cannot establish the required guarantee. The positive
+guarded-sync fixtures exercise the shared-validator protocol. Production
+deployments with this guarantee require separate qualification. Existing
+records without a projection stamp require explicit adoption.
+[Unity 0.0.2 ETag computation](https://github.com/open-lakehouse/unitycatalog-rs/blob/7ab5d624fc1ce2b6ba5bbba21ab286c196980082/crates/uc-delta/src/table.rs#L35)
+and [General Tables update](https://github.com/open-lakehouse/unitycatalog-rs/blob/7ab5d624fc1ce2b6ba5bbba21ab286c196980082/crates/uc-metastore/src/table/sql.rs#L474).
 
 The Unity profile supports unpartitioned tables with `long` and `string`
 columns and empty field metadata. It publishes the schema, table comment, and
@@ -25,6 +39,10 @@ sync stamp. `SyncResult` includes a status (`updated`, `unchanged`, or
 version, and digest.
 
 ## Run the Unity cookbook
+
+Run the publishing example only on a deployment qualified for the shared strong
+validator contract. The example commits the schema change to Delta before it
+synchronizes the catalog. On stock 0.0.2, only registration and load are available.
 
 With a supported Unity catalog and schema, an existing Delta table, and your
 Unity connection configured through the environment, run the example from the

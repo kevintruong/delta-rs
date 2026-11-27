@@ -6,6 +6,7 @@ use deltalake_core::data_catalog::{
     CatalogResult, CatalogRevision, CatalogSyncProjection, CatalogSyncState, CatalogSyncUpdate,
     CatalogSyncWriteOutcome, CatalogSyncWriter, CatalogTable, TableIdentifier, TableRegistration,
 };
+use reqwest::header::{ETAG, HeaderMap};
 use reqwest::{StatusCode, Url};
 use sha2::{Digest, Sha256};
 use url::Host;
@@ -21,13 +22,15 @@ const FORMAT: &str = "delta-rs.sync-format";
 const VERSION: &str = "delta-rs.sync-version";
 const DIGEST: &str = "delta-rs.sync-digest";
 
-/// Unity deployments with verified external Delta metadata update semantics.
+/// Unity external Delta metadata protocols selectable for negotiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum UnitySyncProfile {
     /// The OSS Rust Unity Catalog server 0.0.2 implementing Delta REST protocol 1.0.
     ///
-    /// The verified projection covers table descriptions and unpartitioned
+    /// Guarded writes require the deployment to expose a shared strong validator
+    /// on General Tables and enforce it on all writes. Stock 0.0.2 omits this
+    /// validator. The projection covers table descriptions and unpartitioned
     /// `bigint` and `string` columns without custom field metadata.
     OssRustServer002,
 }
@@ -65,7 +68,7 @@ impl UnityCatalog {
         Ok(self)
     }
 
-    /// Whether this client was configured with a qualified guarded sync profile.
+    /// Whether this client was configured to negotiate guarded sync.
     ///
     /// Individual tables must also support the negotiated protocol and projection.
     pub fn supports_guarded_sync(&self) -> bool {
@@ -244,6 +247,19 @@ fn read_stamp(id: &TableIdentifier, table: &Table) -> CatalogResult<CatalogProje
     )
 }
 
+/// Only a single strong validator identifies the exact General Tables representation
+/// used to prepare or confirm a mutation (RFC 9110, section 8.8.3).
+fn strong_table_etag(headers: &HeaderMap) -> Option<&[u8]> {
+    let mut tags = headers.get_all(ETAG).iter();
+    let raw = tags.next()?.as_bytes();
+    let opaque = raw.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    (tags.next().is_none()
+        && opaque
+            .iter()
+            .all(|&c| c == b'!' || (0x23..=0x7e).contains(&c) || c >= 0x80))
+    .then_some(opaque)
+}
+
 #[async_trait::async_trait]
 impl CatalogSyncWriter for UnityCatalog {
     type Record = UnitySyncRecord;
@@ -254,19 +270,17 @@ impl CatalogSyncWriter for UnityCatalog {
         id: &TableIdentifier,
     ) -> CatalogResult<Option<CatalogSyncState<Self::Record>>> {
         let session = self.metadata_session(id).await?;
-        // Bracket the independent General Tables observation with reads of the
-        // atomic guard. A change in either the UUID or ETag invalidates the view.
-        let before = session.load().await;
+        let observation = session.load().await;
         let response = session.tables_response().await.map_err(provider_error)?;
+        let tables_etag = strong_table_etag(response.headers()).map(<[u8]>::to_vec);
         let Some((table, entry)) = parse_external_table(id, response).await? else {
             return Ok(None);
         };
-        let before = before.map_err(|error| read_error(id, error))?;
-        let observation = session
-            .load()
-            .await
-            .map_err(|error| read_error(id, error))?;
-        if before != observation || Uuid::parse_str(&table.table_id) != Ok(observation.id) {
+        let observation = observation.map_err(|error| read_error(id, error))?;
+        let tables_etag = tables_etag.ok_or_else(|| unsupported(id))?;
+        if tables_etag != observation.etag.as_bytes()
+            || Uuid::parse_str(&table.table_id) != Ok(observation.id)
+        {
             return Err(CatalogLifecycleError::Conflict { table: id.clone() });
         }
         let fields = ProjectedFields::from_table(&table).ok_or_else(|| unsupported(id))?;
